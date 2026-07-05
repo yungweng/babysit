@@ -315,7 +315,7 @@ fi
 git worktree add --quiet --detach "$WORKTREE" "$HEAD_SHA"
 echo "Worktree: $WORKTREE (PR head $HEAD_SHA)"
 
-# shellcheck disable=SC2329  # invoked via the EXIT trap below
+# shellcheck disable=SC2329,SC2317  # invoked via the EXIT trap below
 cleanup() {
   local rc=$?
   if [ "$rc" -eq 0 ] && [ "$CLEANUP" -eq 1 ] && [ -d "$WORKTREE" ]; then
@@ -365,7 +365,7 @@ check_envrc() {
   fi
 }
 
-# shellcheck disable=SC2329  # invoked indirectly via run_with_timeout "$@"
+# shellcheck disable=SC2329,SC2317  # invoked indirectly via run_with_timeout "$@"
 run_in_worktree() {
   if [ "$DIRENV_ACTIVE" -eq 1 ]; then
     (cd "$WORKTREE" && direnv exec "$WORKTREE" "$@")
