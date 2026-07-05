@@ -1,36 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 SCRIPT_STARTED="$(date +%s)"
 
 usage() {
   cat <<'EOF'
 Usage:
-  pr-codex-pipeline [options] <task>
+  pr-codex-pipeline [options] [pr-number|pr-url] [extra context...]
 
-The task is a free-text prompt, a GitHub issue number, or a GitHub issue URL.
+Runs the review-fix-CI cycle for an existing GitHub PR until pr-codex-review
+reports zero Blockers and Critical findings and CI is green:
 
-The pipeline plans (with your approval), implements, opens a PR, iterates on
-red CI, then loops "pr-codex-review -> fix" until the review reports zero
-Blockers and Critical findings. You get a macOS notification whenever it
-needs you (plan approval, open questions) and when it finishes.
+  1. Wait for CI; red checks go to a Codex fix session (up to --max-ci-fixes).
+  2. Run pr-codex-review, which posts its review comment to the PR.
+  3. Zero Blockers and Critical -> done, notification.
+     Otherwise -> Codex fix round, push, back to 1 (up to --max-iter rounds).
+
+Without a PR argument the PR of the current branch is used. Any extra
+positional text is handed to the Codex fix session as additional context.
+
+The PR's implementation must be committed and pushed before starting: the
+pipeline works on the pushed PR head in its own worktree and never touches
+your checkout. If Codex hits a product decision it cannot make, you get a
+macOS notification and answer directly in the terminal; the run continues.
 
 Options:
-  --branch NAME            Branch to create. Default: suggested by the plan
-  --base BRANCH            PR base branch. Default: repo default branch
-  --model MODEL            Model for the implementation Codex session.
+  --model MODEL            Model for the Codex fix sessions.
                            Default: your codex default
-  --effort LEVEL           Reasoning effort for the implementation session:
+  --effort LEVEL           Reasoning effort for the Codex fix sessions:
                            minimal, low, medium, high, xhigh
   --reviewers N            Reviewer passes per pr-codex-review round.
                            Default: pr-codex-review default
   --review-model MODEL     Model for pr-codex-review. Default: codex default
   --review-effort LEVEL    Effort for pr-codex-review. Default: codex default
-  --max-iter N             Max review->fix iterations. Default: 3
+  --max-iter N             Max review->fix rounds. Default: 3
   --max-ci-fixes N         Max CI fix attempts per green-CI phase. Default: 3
-  --draft                  Open the PR as a draft
-  --no-plan-gate           Skip interactive plan approval
   --no-notify              Disable macOS notifications
   --no-direnv              Skip direnv allow/exec
   --keep-worktree          Keep the temporary worktree after success
@@ -39,15 +44,15 @@ Options:
 
 Exit codes:
   0  success, PR is green and review-clean
-  2  aborted at a gate (plan, questions, .envrc change)
+  2  aborted at a gate (open questions, .envrc change)
   3  CI still red after --max-ci-fixes attempts
   4  review not converged after --max-iter rounds
-  5  a fix round produced no changes
+  5  a fix round produced no changes although findings remain
 
 Examples:
-  pr-codex-pipeline 1798
-  pr-codex-pipeline --model gpt-5.5 --effort high "Add CSV export to the report page"
-  pr-codex-pipeline https://github.com/owner/repo/issues/42 --max-iter 2
+  pr-codex-pipeline                  # PR of the current branch
+  pr-codex-pipeline 1811
+  pr-codex-pipeline 1811 --effort high "Focus on the time-tracking module"
 EOF
 }
 
@@ -60,8 +65,8 @@ need() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
-BRANCH=""
-BASE_BRANCH=""
+PR_ARG=""
+CONTEXT_INPUT=""
 MODEL=""
 EFFORT=""
 REVIEWERS=""
@@ -69,19 +74,12 @@ REVIEW_MODEL=""
 REVIEW_EFFORT=""
 MAX_ITER=3
 MAX_CI_FIXES=3
-DRAFT=0
-PLAN_GATE=1
 NOTIFY=1
 USE_DIRENV=1
 CLEANUP=1
-TASK_INPUT=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --branch)         BRANCH="${2:-}"; shift 2 ;;
-    --branch=*)       BRANCH="${1#*=}"; shift ;;
-    --base)           BASE_BRANCH="${2:-}"; shift 2 ;;
-    --base=*)         BASE_BRANCH="${1#*=}"; shift ;;
     --model)          MODEL="${2:-}"; shift 2 ;;
     --model=*)        MODEL="${1#*=}"; shift ;;
     --effort)         EFFORT="${2:-}"; shift 2 ;;
@@ -96,8 +94,6 @@ while [ "$#" -gt 0 ]; do
     --max-iter=*)     MAX_ITER="${1#*=}"; shift ;;
     --max-ci-fixes)   MAX_CI_FIXES="${2:-}"; shift 2 ;;
     --max-ci-fixes=*) MAX_CI_FIXES="${1#*=}"; shift ;;
-    --draft)          DRAFT=1; shift ;;
-    --no-plan-gate)   PLAN_GATE=0; shift ;;
     --no-notify)      NOTIFY=0; shift ;;
     --no-direnv)      USE_DIRENV=0; shift ;;
     --keep-worktree)  CLEANUP=0; shift ;;
@@ -105,17 +101,18 @@ while [ "$#" -gt 0 ]; do
     -h|--help)        usage; exit 0 ;;
     -*)               die "unknown option: $1" ;;
     *)
-      if [ -n "$TASK_INPUT" ]; then
-        TASK_INPUT="$TASK_INPUT $1"
+      if [ -z "$PR_ARG" ] && { [[ "$1" =~ ^[0-9]+$ ]] || [[ "$1" =~ ^https://github\.com/[^/]+/[^/]+/pull/[0-9]+ ]]; }; then
+        PR_ARG="$1"
+      elif [ -n "$CONTEXT_INPUT" ]; then
+        CONTEXT_INPUT="$CONTEXT_INPUT $1"
       else
-        TASK_INPUT="$1"
+        CONTEXT_INPUT="$1"
       fi
       shift
       ;;
   esac
 done
 
-[ -n "$TASK_INPUT" ] || { usage; exit 1; }
 [[ "$MAX_ITER" =~ ^[0-9]+$ ]] || die "--max-iter must be a number"
 [[ "$MAX_CI_FIXES" =~ ^[0-9]+$ ]] || die "--max-ci-fixes must be a number"
 [ "$MAX_ITER" -ge 1 ] || die "--max-iter must be >= 1"
@@ -182,16 +179,6 @@ notify() {
     "$1" "$2" >/dev/null 2>&1 || true
 }
 
-show_message() {
-  echo
-  if [ -t 1 ] && command -v glow >/dev/null 2>&1; then
-    glow "$1" || cat "$1"
-  else
-    cat "$1"
-    echo
-  fi
-}
-
 format_duration() {
   local total="$1"
   printf '%dm%02ds' "$((total / 60))" "$((total % 60))"
@@ -201,40 +188,47 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run from inside
 CURRENT_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 SAFE_REPO="${CURRENT_REPO//\//-}"
 
-if [ -z "$BASE_BRANCH" ]; then
-  BASE_BRANCH="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)"
-  [ -n "$BASE_BRANCH" ] || die "could not determine the default branch; pass --base"
-fi
-BASE_REF="origin/$BASE_BRANCH"
+# --- Resolve the PR -----------------------------------------------------------
 
-# --- Resolve the task: free text, issue number, or issue URL -----------------
-
-ISSUE_NUMBER=""
-if [[ "$TASK_INPUT" =~ ^[0-9]+$ ]]; then
-  ISSUE_NUMBER="$TASK_INPUT"
-elif [[ "$TASK_INPUT" =~ ^https://github\.com/([^/]+/[^/]+)/issues/([0-9]+) ]]; then
-  [ "${BASH_REMATCH[1]}" = "$CURRENT_REPO" ] || die "issue URL is for ${BASH_REMATCH[1]}, but current checkout is $CURRENT_REPO"
-  ISSUE_NUMBER="${BASH_REMATCH[2]}"
+if [[ "$PR_ARG" =~ ^https://github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+  [ "${BASH_REMATCH[1]}" = "$CURRENT_REPO" ] || die "PR URL is for ${BASH_REMATCH[1]}, but current checkout is $CURRENT_REPO"
+  PR_ARG="${BASH_REMATCH[2]}"
 fi
 
-if [ -n "$ISSUE_NUMBER" ]; then
-  ISSUE_META="$(gh issue view "$ISSUE_NUMBER" --json number,title,body,url)"
-  ISSUE_TITLE="$(jq -r '.title' <<<"$ISSUE_META")"
-  ISSUE_URL="$(jq -r '.url' <<<"$ISSUE_META")"
-  TASK_TEXT="GitHub issue #$ISSUE_NUMBER: $ISSUE_TITLE
-Issue URL: $ISSUE_URL
-
-$(jq -r '.body' <<<"$ISSUE_META")"
-  TASK_LABEL="issue #$ISSUE_NUMBER $ISSUE_TITLE"
+if [ -n "$PR_ARG" ]; then
+  PR_META="$(gh pr view "$PR_ARG" --json number,title,body,url,state,headRefName,baseRefName,headRefOid)"
 else
-  TASK_TEXT="$TASK_INPUT"
-  TASK_LABEL="$TASK_INPUT"
+  PR_META="$(gh pr view --json number,title,body,url,state,headRefName,baseRefName,headRefOid 2>/dev/null)" \
+    || die "no PR found for the current branch; pass a PR number"
+fi
+PR_STATE="$(jq -r '.state' <<<"$PR_META")"
+[ "$PR_STATE" = "OPEN" ] || die "PR is $PR_STATE, expected an open PR"
+PR_NUMBER="$(jq -r '.number' <<<"$PR_META")"
+PR_TITLE="$(jq -r '.title' <<<"$PR_META")"
+PR_URL="$(jq -r '.url' <<<"$PR_META")"
+BRANCH="$(jq -r '.headRefName' <<<"$PR_META")"
+BASE_BRANCH="$(jq -r '.baseRefName' <<<"$PR_META")"
+HEAD_SHA_META="$(jq -r '.headRefOid' <<<"$PR_META")"
+
+PR_CONTEXT="PR #$PR_NUMBER: $PR_TITLE
+Branch: $BRANCH (base: $BASE_BRANCH)
+URL: $PR_URL
+
+PR description:
+
+$(jq -r '.body' <<<"$PR_META")"
+if [ -n "$CONTEXT_INPUT" ]; then
+  PR_CONTEXT="$PR_CONTEXT
+
+Additional context from the user:
+
+$CONTEXT_INPUT"
 fi
 
-# --- Run directory and worktree ----------------------------------------------
+# --- Run directory and worktree ------------------------------------------------
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
-RUN_ROOT="$HOME/.cache/pr-codex-pipeline/$SAFE_REPO-$RUN_ID"
+RUN_ROOT="$HOME/.cache/pr-codex-pipeline/$SAFE_REPO-pr-$PR_NUMBER-$RUN_ID"
 WORKTREE="$RUN_ROOT/worktree"
 LOG_DIR="$RUN_ROOT/logs"
 MSG_DIR="$RUN_ROOT/messages"
@@ -258,19 +252,34 @@ fi
 
 echo "${C_BOLD}pr-codex-pipeline v$VERSION${C_RESET}"
 hr
-row "Task" "$TASK_LABEL"
+row "PR" "${C_BOLD}#$PR_NUMBER $PR_TITLE${C_RESET}"
 row "Repo" "$CURRENT_REPO"
-row "Base" "$BASE_REF"
+row "Branch" "$BRANCH -> $BASE_BRANCH"
 row "Model" "$MODEL_DESC"
 row "Loops" "max $MAX_ITER review rounds, $MAX_CI_FIXES CI fixes"
 row "Run dir" "$RUN_ROOT"
 hr
 
 cd "$REPO_ROOT"
-git fetch -q origin "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
-BASE_SHA="$(git rev-parse "$BASE_REF")"
-git worktree add --quiet --detach "$WORKTREE" "$BASE_SHA"
-echo "Worktree: $WORKTREE (base $BASE_SHA)"
+
+# The pipeline reviews the pushed PR head. Local work that only exists in the
+# user's checkout would silently be ignored, so refuse to start in that case.
+if [ "$(git rev-parse --abbrev-ref HEAD)" = "$BRANCH" ] && [ -n "$(git status --porcelain)" ]; then
+  die "your checkout of $BRANCH has uncommitted changes; commit and push them first so the pipeline sees them"
+fi
+
+git fetch -q origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+HEAD_SHA="$(git rev-parse "origin/$BRANCH")"
+if [ "$HEAD_SHA" != "$HEAD_SHA_META" ]; then
+  echo "warning: origin/$BRANCH ($HEAD_SHA) differs from GitHub metadata ($HEAD_SHA_META); using origin/$BRANCH" >&2
+fi
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  LOCAL_SHA="$(git rev-parse "refs/heads/$BRANCH")"
+  [ "$LOCAL_SHA" = "$HEAD_SHA" ] || die "local branch $BRANCH ($LOCAL_SHA) differs from origin ($HEAD_SHA); push your local commits first"
+fi
+
+git worktree add --quiet --detach "$WORKTREE" "$HEAD_SHA"
+echo "Worktree: $WORKTREE (PR head $HEAD_SHA)"
 
 # shellcheck disable=SC2329  # invoked via the EXIT trap below
 cleanup() {
@@ -284,7 +293,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- direnv -------------------------------------------------------------------
+# --- direnv ---------------------------------------------------------------------
 
 DIRENV_ACTIVE=0
 ENVRC_STAMP=""
@@ -300,7 +309,7 @@ if [ "$USE_DIRENV" -eq 1 ] && find "$WORKTREE" -name .envrc -print -quit | grep 
   echo "direnv:   allowed"
 fi
 
-# The base-branch .envrc was allowed above. If a later Codex step edits any
+# The PR-head .envrc was allowed above. If a later Codex step edits any
 # .envrc, executing it automatically would run unreviewed code, so gate it.
 check_envrc() {
   [ "$DIRENV_ACTIVE" -eq 1 ] || return 0
@@ -309,7 +318,7 @@ check_envrc() {
   [ "$now" = "$ENVRC_STAMP" ] && return 0
   notify "direnv" ".envrc wurde veraendert, Freigabe noetig"
   echo "${C_RED}A .envrc file changed inside the worktree.${C_RESET}" >&2
-  git -C "$WORKTREE" diff "$BASE_SHA" -- .envrc ':(glob)**/.envrc' >&2 || true
+  git -C "$WORKTREE" diff "$HEAD_SHA" -- .envrc ':(glob)**/.envrc' >&2 || true
   printf 'Run direnv allow for the changed .envrc? [y/N] '
   read -r reply
   if [ "$reply" = "y" ] || [ "$reply" = "Y" ]; then
@@ -329,7 +338,7 @@ run_in_worktree() {
   fi
 }
 
-# --- Codex session plumbing ----------------------------------------------------
+# --- Codex session plumbing -------------------------------------------------------
 
 SESSION_ID=""
 LAST_MSG=""
@@ -380,7 +389,38 @@ codex_resume() {
   [ -s "$LAST_MSG" ] || die "codex produced no final message, see $LOG_DIR/$tag.log"
 }
 
-# --- Gates ---------------------------------------------------------------------
+RULES="You are the fix agent for an existing pull request, running unattended inside an automated pipeline (CI checks -> external code review -> fix rounds), in a dedicated git worktree on a detached checkout of the PR head.
+
+Standing rules for every step:
+- Follow this repository's contributor and agent instructions (AGENTS.md, CLAUDE.md, CONTRIBUTING) where present.
+- Keep changes minimal and focused on the findings you are asked to address; match the existing code style and do not refactor beyond that.
+- Write clean, descriptive commit messages. Never mention AI, agents, Codex, or automation anywhere.
+- Never push, never create or edit PRs or comments, never rewrite published history. The pipeline handles git push.
+- Make reasonable technical decisions yourself.
+- Only for product decisions you cannot responsibly make yourself (data semantics, user-visible policy, migration of existing data): stop and end your final message with a line that is exactly:
+OPEN QUESTIONS:
+followed by short numbered questions. Use this marker for nothing else. You will receive the user's answers and can then continue."
+
+# First call carries the standing rules and PR context; later calls resume the
+# same session, so context carries through all CI and review fix rounds.
+codex_call() {
+  local tag="$1" prompt="$2"
+  if [ -z "$SESSION_ID" ]; then
+    codex_new "$tag" "$RULES
+
+## Pull request
+
+$PR_CONTEXT
+
+## Current step
+
+$prompt"
+  else
+    codex_resume "$tag" "$prompt"
+  fi
+}
+
+# --- Gates ------------------------------------------------------------------------
 
 # Codex ends its final message with an "OPEN QUESTIONS:" line when it needs a
 # product decision. Surface the questions, collect answers, resume the session.
@@ -415,125 +455,20 @@ Continue with the current step using these decisions. All rules from the initial
   done
 }
 
-plan_gate() {
-  local n=0 reply
-  [ "$PLAN_GATE" -eq 1 ] || return 0
-  while :; do
-    show_message "$LAST_MSG"
-    notify "Plan bereit" "Warte auf deine Freigabe"
-    printf '%s' "Approve plan? [Enter] = yes, q = abort, anything else = feedback: "
-    read -r reply
-    case "$reply" in
-      "") break ;;
-      q)
-        echo "Aborted at the plan gate." >&2
-        exit 2
-        ;;
-      *)
-        n=$((n + 1))
-        codex_resume "plan-rev-$n" "User feedback on your plan:
-
-$reply
-
-Revise the plan accordingly. Still do not modify any files. End your final message with a single line 'BRANCH: <suggested branch name>' as before."
-        question_gate "plan-rev-$n"
-        ;;
-    esac
-  done
-}
-
-# --- Prompts -------------------------------------------------------------------
-
-RULES="You are the implementation agent inside an unattended pipeline (plan -> implement -> PR -> CI -> external code review -> fix rounds), working in a dedicated git worktree.
-
-Standing rules for every step:
-- Follow this repository's own contributor and agent instructions (AGENTS.md, CLAUDE.md, CONTRIBUTING) where present.
-- Keep changes minimal and focused on the task; match the existing code style.
-- Write clean, descriptive branch names, commit messages, and PR text. Never mention AI, agents, Codex, or automation anywhere.
-- Never push, never create or edit PRs or comments, never rewrite published history. The pipeline handles git push and the PR.
-- Make reasonable technical decisions yourself and remember them; you will summarize them in the PR description later.
-- Only for product decisions you cannot responsibly make yourself (data semantics, user-visible policy, migration of existing data): stop and end your final message with a line that is exactly:
-OPEN QUESTIONS:
-followed by short numbered questions. Use this marker for nothing else. You will receive the user's answers and can then continue."
-
-# --- Phase 1: plan --------------------------------------------------------------
-
-step "Phase 1/5: plan"
-codex_new "plan" "$RULES
-
-## Task
-
-$TASK_TEXT
-
-## Current step
-
-Explore the repository, then produce a concrete implementation plan in Markdown: affected files, intended changes, and a test plan. Do not modify any files yet.
-End your final message with a single line:
-BRANCH: <suggested branch name following this repository's conventions>"
-question_gate "plan"
-plan_gate
-
-if [ -z "$BRANCH" ]; then
-  BRANCH="$(sed -nE 's/^BRANCH:[[:space:]]*([A-Za-z0-9._/-]+).*$/\1/p' "$LAST_MSG" | tail -1)"
-fi
-[ -n "$BRANCH" ] || BRANCH="pipeline/$RUN_ID"
-git check-ref-format --branch "$BRANCH" >/dev/null 2>&1 || die "invalid branch name: $BRANCH"
-if [ -n "$(git ls-remote --heads origin "$BRANCH")" ]; then
-  die "branch $BRANCH already exists on origin; rerun with --branch"
-fi
-git -C "$WORKTREE" checkout -q -b "$BRANCH" || die "could not create branch $BRANCH (does it exist locally?)"
-echo "Branch:   $BRANCH"
-
-# --- Phase 2: implement ----------------------------------------------------------
-
-step "Phase 2/5: implement"
-codex_resume "implement" "The plan is approved as-is. Implement it now.
-
-- Run the repository's relevant checks (tests, lint, typecheck) for the code you touched and get them passing.
-- Commit all changes in clean logical commits on the current branch.
-- Do not push."
-question_gate "implement"
-
 ensure_committed() {
   local tag="$1"
   if [ -n "$(git -C "$WORKTREE" status --porcelain)" ]; then
-    codex_resume "$tag-commit" "There are uncommitted changes in the worktree. Review them and commit everything that belongs to the task (git add + git commit with a descriptive message). Do not push."
+    codex_call "$tag-commit" "There are uncommitted changes in the worktree. Review them and commit everything that belongs to the task (git add + git commit with a descriptive message). Do not push."
     question_gate "$tag-commit"
   fi
   [ -z "$(git -C "$WORKTREE" status --porcelain)" ] || die "worktree still has uncommitted changes; inspect $WORKTREE"
 }
 
-ensure_committed "implement"
-COMMITS="$(git -C "$WORKTREE" rev-list --count "$BASE_SHA..HEAD")"
-[ "$COMMITS" -ge 1 ] || die "implementation produced no commits"
+push_branch() {
+  git -C "$WORKTREE" push -q origin "HEAD:refs/heads/$BRANCH"
+}
 
-# --- Phase 3: push and open the PR -------------------------------------------------
-
-step "Phase 3/5: push and open PR"
-git -C "$WORKTREE" push -q -u origin "$BRANCH"
-
-CLOSES_LINE=""
-[ -z "$ISSUE_NUMBER" ] || CLOSES_LINE="Include the line \"Closes #$ISSUE_NUMBER\"."
-codex_resume "pr-message" "Output ONLY the pull request title on the first line, then one blank line, then the pull request body in Markdown.
-
-Body rules:
-- Concisely describe what changed and why.
-- Include a short \"Assumptions\" section listing the notable decisions you made. $CLOSES_LINE
-- Do not ask questions and do not use the OPEN QUESTIONS marker here.
-- Do not wrap anything in a code fence."
-
-PR_TITLE="$(head -n 1 "$LAST_MSG" | sed -E 's/^#+[[:space:]]*//; s/^Title:[[:space:]]*//')"
-[ -n "$PR_TITLE" ] || die "empty PR title in $LAST_MSG"
-PR_BODY_FILE="$MSG_DIR/pr-body.md"
-tail -n +2 "$LAST_MSG" | sed '/./,$!d' > "$PR_BODY_FILE"
-
-PR_CREATE_ARGS=(--head "$BRANCH" --base "$BASE_BRANCH" --title "$PR_TITLE" --body-file "$PR_BODY_FILE")
-[ "$DRAFT" -eq 0 ] || PR_CREATE_ARGS+=(--draft)
-PR_URL="$(gh pr create "${PR_CREATE_ARGS[@]}")"
-PR_NUMBER="$(gh pr view "$BRANCH" --json number -q .number)"
-echo "PR:       #$PR_NUMBER $PR_URL"
-
-# --- Phase 4/5: CI loop and review loop ---------------------------------------------
+# --- CI ---------------------------------------------------------------------------
 
 # Prints pass|none|fail. Retries while GitHub has not registered checks yet.
 ci_status() {
@@ -587,20 +522,22 @@ ensure_ci_green() {
         fi
         echo "${C_RED}CI red; starting fix attempt $attempt/$MAX_CI_FIXES.${C_RESET}"
         fails="$(gh pr checks "$PR_NUMBER" --json name,bucket,workflow,link,description 2>/dev/null | jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")]')"
-        codex_resume "ci-fix-$attempt" "CI on PR #$PR_NUMBER is red. Failing checks as JSON:
+        codex_call "ci-fix-$attempt" "CI on PR #$PR_NUMBER is red. Failing checks as JSON:
 
 $fails
 
 Inspect the failures with gh (for example: gh run view <run-id> --log-failed; the run id is the number after /runs/ in the link). Reproduce locally where practical, fix the problems, run the affected checks locally, and commit. Do not push."
         question_gate "ci-fix-$attempt"
         ensure_committed "ci-fix-$attempt"
-        git -C "$WORKTREE" push -q origin "$BRANCH"
+        push_branch
         ;;
     esac
   done
 }
 
-step "Phase 4/5: CI"
+# --- Main loop ----------------------------------------------------------------------
+
+step "CI"
 if ! ensure_ci_green; then
   notify "CI rot" "PR #$PR_NUMBER nach $MAX_CI_FIXES Fix-Versuchen weiter rot"
   echo "CI still red after $MAX_CI_FIXES fix attempts: $PR_URL" >&2
@@ -608,7 +545,6 @@ if ! ensure_ci_green; then
   exit 3
 fi
 
-step "Phase 5/5: review loop"
 CONVERGED=0
 ITERATION=0
 REVIEW_ARGS=()
@@ -618,8 +554,7 @@ REVIEW_ARGS=()
 
 while [ "$ITERATION" -lt "$MAX_ITER" ]; do
   ITERATION=$((ITERATION + 1))
-  echo
-  echo "${C_BOLD}Review round $ITERATION/$MAX_ITER${C_RESET}"
+  step "Review round $ITERATION/$MAX_ITER"
   pr-codex-review "$PR_NUMBER" ${REVIEW_ARGS[@]+"${REVIEW_ARGS[@]}"} \
     || die "pr-codex-review failed; fix the review setup and rerun"
 
@@ -640,7 +575,7 @@ while [ "$ITERATION" -lt "$MAX_ITER" ]; do
 
   echo "${C_RED}$BLOCKERS blockers, $CRITICAL critical -> fix round${C_RESET}"
   PRE_FIX_SHA="$CURRENT_SHA"
-  codex_resume "fix-round-$ITERATION" "An external code review of PR #$PR_NUMBER found issues. The full review comment follows below.
+  codex_call "fix-round-$ITERATION" "An external code review of PR #$PR_NUMBER found issues. The full review comment follows below.
 
 - Fix ALL items listed under Blockers and Critical.
 - Address the Suggestions: implement each one unless you have a strong technical reason not to.
@@ -660,7 +595,7 @@ $(cat "$REVIEW_RUN/output/final-pr-comment.md")"
     exit 5
   fi
 
-  git -C "$WORKTREE" push -q origin "$BRANCH"
+  push_branch
   if ! ensure_ci_green; then
     notify "CI rot" "PR #$PR_NUMBER nach Fix-Runde $ITERATION weiter rot"
     echo "CI still red after review fix round $ITERATION: $PR_URL" >&2
@@ -669,7 +604,7 @@ $(cat "$REVIEW_RUN/output/final-pr-comment.md")"
   fi
 done
 
-# --- Summary -------------------------------------------------------------------
+# --- Summary -------------------------------------------------------------------------
 
 echo
 hr

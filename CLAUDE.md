@@ -4,7 +4,7 @@ Guidance for coding agents working in this repository.
 
 ## What this is
 
-A single Bash script (`bin/pr-codex-pipeline`) that automates the implement-review cycle for one task: a resumable `codex exec` session plans and implements, the script pushes and opens a PR, waits on CI with `gh pr checks --watch`, and loops `pr-codex-review` plus fix rounds until `findings.json` reports zero Blockers and Critical findings. Interactive gates (plan approval, OPEN QUESTIONS, `.envrc` changes) block in the terminal and fire macOS notifications.
+A single Bash script (`bin/pr-codex-pipeline`) that automates the iterate-until-clean part of a PR: wait for CI, let a resumable `codex exec` session fix red checks, run `pr-codex-review`, feed the findings back as fix rounds, and stop when `findings.json` reports zero Blockers and Critical findings. Issue selection, planning, and the first implementation are deliberately NOT part of this tool; the user does those. Gates (OPEN QUESTIONS from Codex, `.envrc` changes) block in the terminal and fire macOS notifications.
 
 ## Layout
 
@@ -19,8 +19,9 @@ README.md               user-facing docs, keep in sync with --help
 - Runtime dependencies are `gh`, `git`, `jq`, `codex`, `pr-codex-review` (>= 1.2.0 for `findings.json`), and optionally `direnv`. Do not add new ones casually.
 - The `--help` text, the option parsing, and the README option list describe the same flags. When you touch one, update all three.
 - The loop condition is Blockers + Critical only. Suggestions and Questions are handed to the fix round once but must never keep the loop alive; that would prevent convergence.
-- Safety stops are deliberate: gating changed `.envrc` files, aborting when a fix round produces no commits, refusing existing remote branches, and treating a failed `pr-codex-review` run as fatal. Do not weaken them to make a run pass.
+- Safety stops are deliberate: refusing dirty/diverged local branches at start, gating changed `.envrc` files, aborting when a fix round produces no commits, and treating a failed `pr-codex-review` run as fatal. Do not weaken them to make a run pass.
 - The Codex session id is recovered by matching the worktree path against rollout files under `~/.codex/sessions/`; the worktree path is unique per run, which is what makes this safe. Keep it that way.
+- The pipeline works on a detached worktree of the pushed PR head and pushes via `HEAD:refs/heads/<branch>`. It must never touch the user's checkout.
 
 ## Checks before committing
 
