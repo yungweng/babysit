@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+SCRIPT_STARTED="$(date +%s)"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  pr-codex-pipeline [options] <task>
+
+The task is a free-text prompt, a GitHub issue number, or a GitHub issue URL.
+
+The pipeline plans (with your approval), implements, opens a PR, iterates on
+red CI, then loops "pr-codex-review -> fix" until the review reports zero
+Blockers and Critical findings. You get a macOS notification whenever it
+needs you (plan approval, open questions) and when it finishes.
+
+Options:
+  --branch NAME            Branch to create. Default: suggested by the plan
+  --base BRANCH            PR base branch. Default: repo default branch
+  --model MODEL            Model for the implementation Codex session.
+                           Default: your codex default
+  --effort LEVEL           Reasoning effort for the implementation session:
+                           minimal, low, medium, high, xhigh
+  --reviewers N            Reviewer passes per pr-codex-review round.
+                           Default: pr-codex-review default
+  --review-model MODEL     Model for pr-codex-review. Default: codex default
+  --review-effort LEVEL    Effort for pr-codex-review. Default: codex default
+  --max-iter N             Max review->fix iterations. Default: 3
+  --max-ci-fixes N         Max CI fix attempts per green-CI phase. Default: 3
+  --draft                  Open the PR as a draft
+  --no-plan-gate           Skip interactive plan approval
+  --no-notify              Disable macOS notifications
+  --no-direnv              Skip direnv allow/exec
+  --keep-worktree          Keep the temporary worktree after success
+  --version                Show version
+  -h, --help               Show this help
+
+Exit codes:
+  0  success, PR is green and review-clean
+  2  aborted at a gate (plan, questions, .envrc change)
+  3  CI still red after --max-ci-fixes attempts
+  4  review not converged after --max-iter rounds
+  5  a fix round produced no changes
+
+Examples:
+  pr-codex-pipeline 1798
+  pr-codex-pipeline --model gpt-5.5 --effort high "Add CSV export to the report page"
+  pr-codex-pipeline https://github.com/owner/repo/issues/42 --max-iter 2
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+BRANCH=""
+BASE_BRANCH=""
+MODEL=""
+EFFORT=""
+REVIEWERS=""
+REVIEW_MODEL=""
+REVIEW_EFFORT=""
+MAX_ITER=3
+MAX_CI_FIXES=3
+DRAFT=0
+PLAN_GATE=1
+NOTIFY=1
+USE_DIRENV=1
+CLEANUP=1
+TASK_INPUT=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --branch)         BRANCH="${2:-}"; shift 2 ;;
+    --branch=*)       BRANCH="${1#*=}"; shift ;;
+    --base)           BASE_BRANCH="${2:-}"; shift 2 ;;
+    --base=*)         BASE_BRANCH="${1#*=}"; shift ;;
+    --model)          MODEL="${2:-}"; shift 2 ;;
+    --model=*)        MODEL="${1#*=}"; shift ;;
+    --effort)         EFFORT="${2:-}"; shift 2 ;;
+    --effort=*)       EFFORT="${1#*=}"; shift ;;
+    --reviewers)      REVIEWERS="${2:-}"; shift 2 ;;
+    --reviewers=*)    REVIEWERS="${1#*=}"; shift ;;
+    --review-model)   REVIEW_MODEL="${2:-}"; shift 2 ;;
+    --review-model=*) REVIEW_MODEL="${1#*=}"; shift ;;
+    --review-effort)  REVIEW_EFFORT="${2:-}"; shift 2 ;;
+    --review-effort=*) REVIEW_EFFORT="${1#*=}"; shift ;;
+    --max-iter)       MAX_ITER="${2:-}"; shift 2 ;;
+    --max-iter=*)     MAX_ITER="${1#*=}"; shift ;;
+    --max-ci-fixes)   MAX_CI_FIXES="${2:-}"; shift 2 ;;
+    --max-ci-fixes=*) MAX_CI_FIXES="${1#*=}"; shift ;;
+    --draft)          DRAFT=1; shift ;;
+    --no-plan-gate)   PLAN_GATE=0; shift ;;
+    --no-notify)      NOTIFY=0; shift ;;
+    --no-direnv)      USE_DIRENV=0; shift ;;
+    --keep-worktree)  CLEANUP=0; shift ;;
+    --version)        echo "pr-codex-pipeline $VERSION"; exit 0 ;;
+    -h|--help)        usage; exit 0 ;;
+    -*)               die "unknown option: $1" ;;
+    *)
+      if [ -n "$TASK_INPUT" ]; then
+        TASK_INPUT="$TASK_INPUT $1"
+      else
+        TASK_INPUT="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+[ -n "$TASK_INPUT" ] || { usage; exit 1; }
+[[ "$MAX_ITER" =~ ^[0-9]+$ ]] || die "--max-iter must be a number"
+[[ "$MAX_CI_FIXES" =~ ^[0-9]+$ ]] || die "--max-ci-fixes must be a number"
+[ "$MAX_ITER" -ge 1 ] || die "--max-iter must be >= 1"
+[ -z "$REVIEWERS" ] || [[ "$REVIEWERS" =~ ^[0-9]+$ ]] || die "--reviewers must be a number"
+# Codex silently ignores an unknown effort value instead of failing.
+case "$EFFORT" in
+  ""|minimal|low|medium|high|xhigh) ;;
+  *) die "--effort must be one of: minimal, low, medium, high, xhigh" ;;
+esac
+case "$REVIEW_EFFORT" in
+  ""|minimal|low|medium|high|xhigh) ;;
+  *) die "--review-effort must be one of: minimal, low, medium, high, xhigh" ;;
+esac
+
+CODEX_FLAGS=()
+[ -z "$MODEL" ] || CODEX_FLAGS+=(-m "$MODEL")
+[ -z "$EFFORT" ] || CODEX_FLAGS+=(-c "model_reasoning_effort=$EFFORT")
+
+need gh
+need git
+need jq
+need codex
+need pr-codex-review
+if [ "$USE_DIRENV" -eq 1 ]; then
+  need direnv
+fi
+
+C_GREEN=""
+C_RED=""
+C_DIM=""
+C_BOLD=""
+C_RESET=""
+if [ -t 1 ] && [ -n "${TERM:-}" ] && command -v tput >/dev/null 2>&1; then
+  C_GREEN="$(tput setaf 2 2>/dev/null || true)"
+  C_RED="$(tput setaf 1 2>/dev/null || true)"
+  C_DIM="$(tput dim 2>/dev/null || true)"
+  C_BOLD="$(tput bold 2>/dev/null || true)"
+  C_RESET="$(tput sgr0 2>/dev/null || true)"
+fi
+
+HR_LINE="────────────────────────────────────────────────────────────"
+[ -t 1 ] || HR_LINE="------------------------------------------------------------"
+
+hr() {
+  echo "${C_DIM}${HR_LINE}${C_RESET}"
+}
+
+row() {
+  printf '  %-10s %s\n' "$1" "$2"
+}
+
+step() {
+  echo
+  echo "${C_BOLD}==> $*${C_RESET}"
+}
+
+notify() {
+  printf '\a'
+  [ "$NOTIFY" -eq 1 ] || return 0
+  osascript \
+    -e 'on run argv' \
+    -e 'display notification (item 2 of argv) with title "pr-codex-pipeline" subtitle (item 1 of argv) sound name "Glass"' \
+    -e 'end run' \
+    "$1" "$2" >/dev/null 2>&1 || true
+}
+
+show_message() {
+  echo
+  if [ -t 1 ] && command -v glow >/dev/null 2>&1; then
+    glow "$1" || cat "$1"
+  else
+    cat "$1"
+    echo
+  fi
+}
+
+format_duration() {
+  local total="$1"
+  printf '%dm%02ds' "$((total / 60))" "$((total % 60))"
+}
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run from inside the target git repository"
+CURRENT_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+SAFE_REPO="${CURRENT_REPO//\//-}"
+
+if [ -z "$BASE_BRANCH" ]; then
+  BASE_BRANCH="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)"
+  [ -n "$BASE_BRANCH" ] || die "could not determine the default branch; pass --base"
+fi
+BASE_REF="origin/$BASE_BRANCH"
+
+# --- Resolve the task: free text, issue number, or issue URL -----------------
+
+ISSUE_NUMBER=""
+if [[ "$TASK_INPUT" =~ ^[0-9]+$ ]]; then
+  ISSUE_NUMBER="$TASK_INPUT"
+elif [[ "$TASK_INPUT" =~ ^https://github\.com/([^/]+/[^/]+)/issues/([0-9]+) ]]; then
+  [ "${BASH_REMATCH[1]}" = "$CURRENT_REPO" ] || die "issue URL is for ${BASH_REMATCH[1]}, but current checkout is $CURRENT_REPO"
+  ISSUE_NUMBER="${BASH_REMATCH[2]}"
+fi
+
+if [ -n "$ISSUE_NUMBER" ]; then
+  ISSUE_META="$(gh issue view "$ISSUE_NUMBER" --json number,title,body,url)"
+  ISSUE_TITLE="$(jq -r '.title' <<<"$ISSUE_META")"
+  ISSUE_URL="$(jq -r '.url' <<<"$ISSUE_META")"
+  TASK_TEXT="GitHub issue #$ISSUE_NUMBER: $ISSUE_TITLE
+Issue URL: $ISSUE_URL
+
+$(jq -r '.body' <<<"$ISSUE_META")"
+  TASK_LABEL="issue #$ISSUE_NUMBER $ISSUE_TITLE"
+else
+  TASK_TEXT="$TASK_INPUT"
+  TASK_LABEL="$TASK_INPUT"
+fi
+
+# --- Run directory and worktree ----------------------------------------------
+
+RUN_ID="$(date +%Y%m%d-%H%M%S)"
+RUN_ROOT="$HOME/.cache/pr-codex-pipeline/$SAFE_REPO-$RUN_ID"
+WORKTREE="$RUN_ROOT/worktree"
+LOG_DIR="$RUN_ROOT/logs"
+MSG_DIR="$RUN_ROOT/messages"
+mkdir -p "$LOG_DIR" "$MSG_DIR"
+
+while IFS= read -r old_dir; do
+  [ "$old_dir" = "$RUN_ROOT" ] && continue
+  git -C "$REPO_ROOT" worktree remove "$old_dir/worktree" --force >/dev/null 2>&1 || true
+  rm -rf "$old_dir"
+done < <(find "$HOME/.cache/pr-codex-pipeline" -mindepth 1 -maxdepth 1 -type d -mtime +7 2>/dev/null)
+git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+
+MODEL_DESC="codex default"
+if [ -n "$MODEL" ] && [ -n "$EFFORT" ]; then
+  MODEL_DESC="$MODEL (effort $EFFORT)"
+elif [ -n "$MODEL" ]; then
+  MODEL_DESC="$MODEL"
+elif [ -n "$EFFORT" ]; then
+  MODEL_DESC="codex default (effort $EFFORT)"
+fi
+
+echo "${C_BOLD}pr-codex-pipeline v$VERSION${C_RESET}"
+hr
+row "Task" "$TASK_LABEL"
+row "Repo" "$CURRENT_REPO"
+row "Base" "$BASE_REF"
+row "Model" "$MODEL_DESC"
+row "Loops" "max $MAX_ITER review rounds, $MAX_CI_FIXES CI fixes"
+row "Run dir" "$RUN_ROOT"
+hr
+
+cd "$REPO_ROOT"
+git fetch -q origin "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
+BASE_SHA="$(git rev-parse "$BASE_REF")"
+git worktree add --quiet --detach "$WORKTREE" "$BASE_SHA"
+echo "Worktree: $WORKTREE (base $BASE_SHA)"
+
+# shellcheck disable=SC2329  # invoked via the EXIT trap below
+cleanup() {
+  local rc=$?
+  if [ "$rc" -eq 0 ] && [ "$CLEANUP" -eq 1 ] && [ -d "$WORKTREE" ]; then
+    git -C "$REPO_ROOT" worktree remove "$WORKTREE" --force >/dev/null 2>&1 || true
+  elif [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+    # Exit 2 is a user-initiated gate abort; no notification needed for that.
+    notify "Abbruch" "Pipeline gestoppt (exit $rc). Details: $RUN_ROOT"
+  fi
+}
+trap cleanup EXIT
+
+# --- direnv -------------------------------------------------------------------
+
+DIRENV_ACTIVE=0
+ENVRC_STAMP=""
+
+envrc_stamp() {
+  (cd "$WORKTREE" && find . -name .envrc -not -path './.git/*' -exec shasum {} \; 2>/dev/null | sort)
+}
+
+if [ "$USE_DIRENV" -eq 1 ] && find "$WORKTREE" -name .envrc -print -quit | grep -q .; then
+  (cd "$WORKTREE" && direnv allow)
+  DIRENV_ACTIVE=1
+  ENVRC_STAMP="$(envrc_stamp)"
+  echo "direnv:   allowed"
+fi
+
+# The base-branch .envrc was allowed above. If a later Codex step edits any
+# .envrc, executing it automatically would run unreviewed code, so gate it.
+check_envrc() {
+  [ "$DIRENV_ACTIVE" -eq 1 ] || return 0
+  local now reply
+  now="$(envrc_stamp)"
+  [ "$now" = "$ENVRC_STAMP" ] && return 0
+  notify "direnv" ".envrc wurde veraendert, Freigabe noetig"
+  echo "${C_RED}A .envrc file changed inside the worktree.${C_RESET}" >&2
+  git -C "$WORKTREE" diff "$BASE_SHA" -- .envrc ':(glob)**/.envrc' >&2 || true
+  printf 'Run direnv allow for the changed .envrc? [y/N] '
+  read -r reply
+  if [ "$reply" = "y" ] || [ "$reply" = "Y" ]; then
+    (cd "$WORKTREE" && direnv allow)
+    ENVRC_STAMP="$(envrc_stamp)"
+  else
+    echo "Refusing to continue with an unapproved .envrc change." >&2
+    exit 2
+  fi
+}
+
+run_in_worktree() {
+  if [ "$DIRENV_ACTIVE" -eq 1 ]; then
+    (cd "$WORKTREE" && direnv exec "$WORKTREE" "$@")
+  else
+    (cd "$WORKTREE" && "$@")
+  fi
+}
+
+# --- Codex session plumbing ----------------------------------------------------
+
+SESSION_ID=""
+LAST_MSG=""
+
+# Codex records every session as a rollout file whose first line contains the
+# session cwd. The worktree path is unique per run, so matching on it finds
+# exactly our session even when other Codex sessions run in parallel.
+capture_session_id() {
+  local dir f
+  for dir in "$HOME/.codex/sessions/$(date +%Y/%m/%d)" \
+             "$HOME/.codex/sessions/$(date -v-1d +%Y/%m/%d 2>/dev/null || true)"; do
+    [ -d "$dir" ] || continue
+    while IFS= read -r f; do
+      if head -n 1 "$f" 2>/dev/null | grep -Fq "\"cwd\":\"$WORKTREE\""; then
+        SESSION_ID="$(basename "$f" | sed -nE 's/^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/\1/p')"
+        [ -n "$SESSION_ID" ] && return 0
+      fi
+    done < <(ls -t "$dir"/rollout-*.jsonl 2>/dev/null)
+  done
+  return 1
+}
+
+codex_new() {
+  local tag="$1" prompt="$2" rc
+  LAST_MSG="$MSG_DIR/$tag.md"
+  check_envrc
+  set +e
+  run_in_worktree codex exec ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} \
+    -o "$LAST_MSG" "$prompt" </dev/null 2>&1 | tee "$LOG_DIR/$tag.log"
+  rc="${PIPESTATUS[0]}"
+  set -e
+  [ "$rc" -eq 0 ] || die "codex exec failed with exit $rc, see $LOG_DIR/$tag.log"
+  [ -s "$LAST_MSG" ] || die "codex produced no final message, see $LOG_DIR/$tag.log"
+  capture_session_id || die "could not find the Codex session for $WORKTREE under ~/.codex/sessions"
+}
+
+codex_resume() {
+  local tag="$1" prompt="$2" rc
+  [ -n "$SESSION_ID" ] || die "no Codex session to resume"
+  LAST_MSG="$MSG_DIR/$tag.md"
+  check_envrc
+  set +e
+  run_in_worktree codex exec resume "$SESSION_ID" ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} \
+    -o "$LAST_MSG" "$prompt" </dev/null 2>&1 | tee "$LOG_DIR/$tag.log"
+  rc="${PIPESTATUS[0]}"
+  set -e
+  [ "$rc" -eq 0 ] || die "codex exec resume failed with exit $rc, see $LOG_DIR/$tag.log"
+  [ -s "$LAST_MSG" ] || die "codex produced no final message, see $LOG_DIR/$tag.log"
+}
+
+# --- Gates ---------------------------------------------------------------------
+
+# Codex ends its final message with an "OPEN QUESTIONS:" line when it needs a
+# product decision. Surface the questions, collect answers, resume the session.
+question_gate() {
+  local tag_base="$1" n=0 answers line
+  while grep -q '^OPEN QUESTIONS:' "$LAST_MSG"; do
+    n=$((n + 1))
+    notify "Offene Fragen" "Codex braucht eine Entscheidung von dir"
+    echo
+    hr
+    sed -n '/^OPEN QUESTIONS:/,$p' "$LAST_MSG"
+    hr
+    echo "Answer the questions. Finish with an empty line; 'q' aborts the pipeline."
+    answers=""
+    while IFS= read -r line; do
+      if [ "$line" = "q" ]; then
+        echo "Aborted at the question gate." >&2
+        exit 2
+      fi
+      [ -n "$line" ] || break
+      answers="$answers$line
+"
+    done
+    if [ -z "$answers" ]; then
+      echo "No answer given; the questions are shown again."
+      continue
+    fi
+    codex_resume "$tag_base-answers-$n" "Answers from the user to your open questions:
+
+$answers
+Continue with the current step using these decisions. All rules from the initial instructions still apply."
+  done
+}
+
+plan_gate() {
+  local n=0 reply
+  [ "$PLAN_GATE" -eq 1 ] || return 0
+  while :; do
+    show_message "$LAST_MSG"
+    notify "Plan bereit" "Warte auf deine Freigabe"
+    printf '%s' "Approve plan? [Enter] = yes, q = abort, anything else = feedback: "
+    read -r reply
+    case "$reply" in
+      "") break ;;
+      q)
+        echo "Aborted at the plan gate." >&2
+        exit 2
+        ;;
+      *)
+        n=$((n + 1))
+        codex_resume "plan-rev-$n" "User feedback on your plan:
+
+$reply
+
+Revise the plan accordingly. Still do not modify any files. End your final message with a single line 'BRANCH: <suggested branch name>' as before."
+        question_gate "plan-rev-$n"
+        ;;
+    esac
+  done
+}
+
+# --- Prompts -------------------------------------------------------------------
+
+RULES="You are the implementation agent inside an unattended pipeline (plan -> implement -> PR -> CI -> external code review -> fix rounds), working in a dedicated git worktree.
+
+Standing rules for every step:
+- Follow this repository's own contributor and agent instructions (AGENTS.md, CLAUDE.md, CONTRIBUTING) where present.
+- Keep changes minimal and focused on the task; match the existing code style.
+- Write clean, descriptive branch names, commit messages, and PR text. Never mention AI, agents, Codex, or automation anywhere.
+- Never push, never create or edit PRs or comments, never rewrite published history. The pipeline handles git push and the PR.
+- Make reasonable technical decisions yourself and remember them; you will summarize them in the PR description later.
+- Only for product decisions you cannot responsibly make yourself (data semantics, user-visible policy, migration of existing data): stop and end your final message with a line that is exactly:
+OPEN QUESTIONS:
+followed by short numbered questions. Use this marker for nothing else. You will receive the user's answers and can then continue."
+
+# --- Phase 1: plan --------------------------------------------------------------
+
+step "Phase 1/5: plan"
+codex_new "plan" "$RULES
+
+## Task
+
+$TASK_TEXT
+
+## Current step
+
+Explore the repository, then produce a concrete implementation plan in Markdown: affected files, intended changes, and a test plan. Do not modify any files yet.
+End your final message with a single line:
+BRANCH: <suggested branch name following this repository's conventions>"
+question_gate "plan"
+plan_gate
+
+if [ -z "$BRANCH" ]; then
+  BRANCH="$(sed -nE 's/^BRANCH:[[:space:]]*([A-Za-z0-9._/-]+).*$/\1/p' "$LAST_MSG" | tail -1)"
+fi
+[ -n "$BRANCH" ] || BRANCH="pipeline/$RUN_ID"
+git check-ref-format --branch "$BRANCH" >/dev/null 2>&1 || die "invalid branch name: $BRANCH"
+if [ -n "$(git ls-remote --heads origin "$BRANCH")" ]; then
+  die "branch $BRANCH already exists on origin; rerun with --branch"
+fi
+git -C "$WORKTREE" checkout -q -b "$BRANCH" || die "could not create branch $BRANCH (does it exist locally?)"
+echo "Branch:   $BRANCH"
+
+# --- Phase 2: implement ----------------------------------------------------------
+
+step "Phase 2/5: implement"
+codex_resume "implement" "The plan is approved as-is. Implement it now.
+
+- Run the repository's relevant checks (tests, lint, typecheck) for the code you touched and get them passing.
+- Commit all changes in clean logical commits on the current branch.
+- Do not push."
+question_gate "implement"
+
+ensure_committed() {
+  local tag="$1"
+  if [ -n "$(git -C "$WORKTREE" status --porcelain)" ]; then
+    codex_resume "$tag-commit" "There are uncommitted changes in the worktree. Review them and commit everything that belongs to the task (git add + git commit with a descriptive message). Do not push."
+    question_gate "$tag-commit"
+  fi
+  [ -z "$(git -C "$WORKTREE" status --porcelain)" ] || die "worktree still has uncommitted changes; inspect $WORKTREE"
+}
+
+ensure_committed "implement"
+COMMITS="$(git -C "$WORKTREE" rev-list --count "$BASE_SHA..HEAD")"
+[ "$COMMITS" -ge 1 ] || die "implementation produced no commits"
+
+# --- Phase 3: push and open the PR -------------------------------------------------
+
+step "Phase 3/5: push and open PR"
+git -C "$WORKTREE" push -q -u origin "$BRANCH"
+
+CLOSES_LINE=""
+[ -z "$ISSUE_NUMBER" ] || CLOSES_LINE="Include the line \"Closes #$ISSUE_NUMBER\"."
+codex_resume "pr-message" "Output ONLY the pull request title on the first line, then one blank line, then the pull request body in Markdown.
+
+Body rules:
+- Concisely describe what changed and why.
+- Include a short \"Assumptions\" section listing the notable decisions you made. $CLOSES_LINE
+- Do not ask questions and do not use the OPEN QUESTIONS marker here.
+- Do not wrap anything in a code fence."
+
+PR_TITLE="$(head -n 1 "$LAST_MSG" | sed -E 's/^#+[[:space:]]*//; s/^Title:[[:space:]]*//')"
+[ -n "$PR_TITLE" ] || die "empty PR title in $LAST_MSG"
+PR_BODY_FILE="$MSG_DIR/pr-body.md"
+tail -n +2 "$LAST_MSG" | sed '/./,$!d' > "$PR_BODY_FILE"
+
+PR_CREATE_ARGS=(--head "$BRANCH" --base "$BASE_BRANCH" --title "$PR_TITLE" --body-file "$PR_BODY_FILE")
+[ "$DRAFT" -eq 0 ] || PR_CREATE_ARGS+=(--draft)
+PR_URL="$(gh pr create "${PR_CREATE_ARGS[@]}")"
+PR_NUMBER="$(gh pr view "$BRANCH" --json number -q .number)"
+echo "PR:       #$PR_NUMBER $PR_URL"
+
+# --- Phase 4/5: CI loop and review loop ---------------------------------------------
+
+# Prints pass|none|fail. Retries while GitHub has not registered checks yet.
+ci_status() {
+  local waited=0 rc out
+  while :; do
+    set +e
+    out="$(gh pr checks "$PR_NUMBER" --watch --fail-fast 2>&1)"
+    rc=$?
+    set -e
+    printf '%s\n' "$out" | tail -n 20 > "$LOG_DIR/ci-last.log"
+    if [ "$rc" -eq 0 ]; then
+      echo pass
+      return 0
+    fi
+    if printf '%s' "$out" | grep -qi 'no checks reported'; then
+      if [ "$waited" -ge 180 ]; then
+        echo none
+        return 0
+      fi
+      sleep 20
+      waited=$((waited + 20))
+      continue
+    fi
+    if [ "$rc" -eq 8 ]; then
+      sleep 10
+      continue
+    fi
+    echo fail
+    return 0
+  done
+}
+
+ensure_ci_green() {
+  local attempt=0 status fails
+  while :; do
+    echo "${C_DIM}waiting for CI on PR #$PR_NUMBER...${C_RESET}"
+    status="$(ci_status)"
+    case "$status" in
+      pass)
+        echo "${C_GREEN}CI green.${C_RESET}"
+        return 0
+        ;;
+      none)
+        echo "warning: no CI checks reported on this PR; continuing." >&2
+        return 0
+        ;;
+      fail)
+        attempt=$((attempt + 1))
+        if [ "$attempt" -gt "$MAX_CI_FIXES" ]; then
+          return 1
+        fi
+        echo "${C_RED}CI red; starting fix attempt $attempt/$MAX_CI_FIXES.${C_RESET}"
+        fails="$(gh pr checks "$PR_NUMBER" --json name,bucket,workflow,link,description 2>/dev/null | jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")]')"
+        codex_resume "ci-fix-$attempt" "CI on PR #$PR_NUMBER is red. Failing checks as JSON:
+
+$fails
+
+Inspect the failures with gh (for example: gh run view <run-id> --log-failed; the run id is the number after /runs/ in the link). Reproduce locally where practical, fix the problems, run the affected checks locally, and commit. Do not push."
+        question_gate "ci-fix-$attempt"
+        ensure_committed "ci-fix-$attempt"
+        git -C "$WORKTREE" push -q origin "$BRANCH"
+        ;;
+    esac
+  done
+}
+
+step "Phase 4/5: CI"
+if ! ensure_ci_green; then
+  notify "CI rot" "PR #$PR_NUMBER nach $MAX_CI_FIXES Fix-Versuchen weiter rot"
+  echo "CI still red after $MAX_CI_FIXES fix attempts: $PR_URL" >&2
+  trap - EXIT
+  exit 3
+fi
+
+step "Phase 5/5: review loop"
+CONVERGED=0
+ITERATION=0
+REVIEW_ARGS=()
+[ -z "$REVIEWERS" ] || REVIEW_ARGS+=(-n "$REVIEWERS")
+[ -z "$REVIEW_MODEL" ] || REVIEW_ARGS+=(--model "$REVIEW_MODEL")
+[ -z "$REVIEW_EFFORT" ] || REVIEW_ARGS+=(--effort "$REVIEW_EFFORT")
+
+while [ "$ITERATION" -lt "$MAX_ITER" ]; do
+  ITERATION=$((ITERATION + 1))
+  echo
+  echo "${C_BOLD}Review round $ITERATION/$MAX_ITER${C_RESET}"
+  pr-codex-review "$PR_NUMBER" ${REVIEW_ARGS[@]+"${REVIEW_ARGS[@]}"} \
+    || die "pr-codex-review failed; fix the review setup and rerun"
+
+  # shellcheck disable=SC2012  # mtime ordering wanted; run dir names contain no newlines
+  REVIEW_RUN="$(ls -td "$HOME/.cache/pr-codex-review/$SAFE_REPO-pr-$PR_NUMBER-"* 2>/dev/null | head -1)"
+  FINDINGS_JSON="$REVIEW_RUN/output/findings.json"
+  [ -f "$FINDINGS_JSON" ] || die "no findings.json in $REVIEW_RUN (pr-codex-review >= 1.2.0 required)"
+  REVIEWED_SHA="$(jq -r '.head_sha' "$FINDINGS_JSON")"
+  CURRENT_SHA="$(git -C "$WORKTREE" rev-parse HEAD)"
+  [ "$REVIEWED_SHA" = "$CURRENT_SHA" ] || die "findings.json is for $REVIEWED_SHA but the branch is at $CURRENT_SHA"
+
+  BLOCKERS="$(jq -r '.blockers' "$FINDINGS_JSON")"
+  CRITICAL="$(jq -r '.critical' "$FINDINGS_JSON")"
+  if [ "$((BLOCKERS + CRITICAL))" -eq 0 ]; then
+    CONVERGED=1
+    break
+  fi
+
+  echo "${C_RED}$BLOCKERS blockers, $CRITICAL critical -> fix round${C_RESET}"
+  PRE_FIX_SHA="$CURRENT_SHA"
+  codex_resume "fix-round-$ITERATION" "An external code review of PR #$PR_NUMBER found issues. The full review comment follows below.
+
+- Fix ALL items listed under Blockers and Critical.
+- Address the Suggestions: implement each one unless you have a strong technical reason not to.
+- Resolve the Questions with your best judgment; only raise OPEN QUESTIONS if one truly needs a product decision.
+- Run the affected checks and commit your work. Do not push.
+
+---
+
+$(cat "$REVIEW_RUN/output/final-pr-comment.md")"
+  question_gate "fix-round-$ITERATION"
+  ensure_committed "fix-round-$ITERATION"
+
+  if [ "$(git -C "$WORKTREE" rev-parse HEAD)" = "$PRE_FIX_SHA" ]; then
+    notify "Festgefahren" "Fix-Runde $ITERATION hat nichts geaendert"
+    echo "Fix round $ITERATION produced no commits although findings remain; a human is needed: $PR_URL" >&2
+    trap - EXIT
+    exit 5
+  fi
+
+  git -C "$WORKTREE" push -q origin "$BRANCH"
+  if ! ensure_ci_green; then
+    notify "CI rot" "PR #$PR_NUMBER nach Fix-Runde $ITERATION weiter rot"
+    echo "CI still red after review fix round $ITERATION: $PR_URL" >&2
+    trap - EXIT
+    exit 3
+  fi
+done
+
+# --- Summary -------------------------------------------------------------------
+
+echo
+hr
+row "PR" "${C_BOLD}#$PR_NUMBER${C_RESET} $PR_URL"
+row "Branch" "$BRANCH"
+row "Rounds" "$ITERATION review round(s)"
+row "Duration" "$(format_duration "$(( $(date +%s) - SCRIPT_STARTED ))")"
+if [ "$CONVERGED" -eq 1 ]; then
+  row "Result" "${C_GREEN}review clean, CI green${C_RESET}"
+  hr
+  notify "Fertig" "PR #$PR_NUMBER ist bereit fuer den manuellen Test"
+  exit 0
+fi
+row "Result" "${C_RED}not converged after $MAX_ITER review rounds${C_RESET}"
+hr
+notify "Nicht konvergiert" "PR #$PR_NUMBER hat nach $MAX_ITER Runden weiter Findings"
+trap - EXIT
+exit 4
