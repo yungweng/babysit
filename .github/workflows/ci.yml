@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n bin/pr-codex-pipeline
+      - name: Shellcheck
+        run: shellcheck bin/pr-codex-pipeline
+      - name: Help renders
+        run: bash bin/pr-codex-pipeline --help
+      - name: Version flag
+        run: bash bin/pr-codex-pipeline --version

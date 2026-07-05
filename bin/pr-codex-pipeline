@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 SCRIPT_STARTED="$(date +%s)"
 
 usage() {
@@ -24,6 +24,10 @@ The PR's implementation must be committed and pushed before starting: the
 pipeline works on the pushed PR head in its own worktree and never touches
 your checkout. If Codex hits a product decision it cannot make, you get a
 macOS notification and answer directly in the terminal; the run continues.
+If Codex is convinced a remaining Blocker/Critical finding is wrong, it
+disputes it instead of changing code; you decide in the terminal whether
+to accept the rebuttal (the run finishes) or send a reply back into the
+session. Gates need an interactive terminal; without one the run aborts.
 
 Options:
   --model MODEL            Model for the Codex fix sessions.
@@ -36,6 +40,8 @@ Options:
   --review-effort LEVEL    Effort for pr-codex-review. Default: codex default
   --max-iter N             Max review->fix rounds. Default: 3
   --max-ci-fixes N         Max CI fix attempts per green-CI phase. Default: 3
+  --fix-timeout DURATION   Kill a Codex fix step that runs longer than this.
+                           Seconds or 30m/1h; 0 disables. Default: 1h
   --no-notify              Disable macOS notifications
   --no-direnv              Skip direnv allow/exec
   --keep-worktree          Keep the temporary worktree after success
@@ -43,8 +49,10 @@ Options:
   -h, --help               Show this help
 
 Exit codes:
-  0  success, PR is green and review-clean
-  2  aborted at a gate (open questions, .envrc change)
+  0  success: CI green and review clean, or remaining findings
+     disputed by Codex and accepted by you
+  2  aborted at a gate (open questions, .envrc change, dispute,
+     or a gate was hit without an interactive terminal)
   3  CI still red after --max-ci-fixes attempts
   4  review not converged after --max-iter rounds
   5  a fix round produced no changes although findings remain
@@ -74,6 +82,7 @@ REVIEW_MODEL=""
 REVIEW_EFFORT=""
 MAX_ITER=3
 MAX_CI_FIXES=3
+FIX_TIMEOUT="1h"
 NOTIFY=1
 USE_DIRENV=1
 CLEANUP=1
@@ -94,6 +103,8 @@ while [ "$#" -gt 0 ]; do
     --max-iter=*)     MAX_ITER="${1#*=}"; shift ;;
     --max-ci-fixes)   MAX_CI_FIXES="${2:-}"; shift 2 ;;
     --max-ci-fixes=*) MAX_CI_FIXES="${1#*=}"; shift ;;
+    --fix-timeout)    FIX_TIMEOUT="${2:-}"; shift 2 ;;
+    --fix-timeout=*)  FIX_TIMEOUT="${1#*=}"; shift ;;
     --no-notify)      NOTIFY=0; shift ;;
     --no-direnv)      USE_DIRENV=0; shift ;;
     --keep-worktree)  CLEANUP=0; shift ;;
@@ -126,6 +137,23 @@ case "$REVIEW_EFFORT" in
   ""|minimal|low|medium|high|xhigh) ;;
   *) die "--review-effort must be one of: minimal, low, medium, high, xhigh" ;;
 esac
+
+duration_to_seconds() {
+  local value="$1"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo "$value"
+  elif [[ "$value" =~ ^([0-9]+)s$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ "$value" =~ ^([0-9]+)m$ ]]; then
+    echo "$((BASH_REMATCH[1] * 60))"
+  elif [[ "$value" =~ ^([0-9]+)h$ ]]; then
+    echo "$((BASH_REMATCH[1] * 3600))"
+  else
+    die "--fix-timeout must be seconds or a duration like 30m, 45m, 1h, or 0"
+  fi
+}
+
+FIX_TIMEOUT_SECONDS="$(duration_to_seconds "$FIX_TIMEOUT")"
 
 CODEX_FLAGS=()
 [ -z "$MODEL" ] || CODEX_FLAGS+=(-m "$MODEL")
@@ -196,9 +224,9 @@ if [[ "$PR_ARG" =~ ^https://github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
 fi
 
 if [ -n "$PR_ARG" ]; then
-  PR_META="$(gh pr view "$PR_ARG" --json number,title,body,url,state,headRefName,baseRefName,headRefOid)"
+  PR_META="$(gh pr view "$PR_ARG" --json number,title,body,url,state,headRefName,baseRefName,headRefOid,isCrossRepository)"
 else
-  PR_META="$(gh pr view --json number,title,body,url,state,headRefName,baseRefName,headRefOid 2>/dev/null)" \
+  PR_META="$(gh pr view --json number,title,body,url,state,headRefName,baseRefName,headRefOid,isCrossRepository 2>/dev/null)" \
     || die "no PR found for the current branch; pass a PR number"
 fi
 PR_STATE="$(jq -r '.state' <<<"$PR_META")"
@@ -209,6 +237,11 @@ PR_URL="$(jq -r '.url' <<<"$PR_META")"
 BRANCH="$(jq -r '.headRefName' <<<"$PR_META")"
 BASE_BRANCH="$(jq -r '.baseRefName' <<<"$PR_META")"
 HEAD_SHA_META="$(jq -r '.headRefOid' <<<"$PR_META")"
+# The pipeline fetches and pushes refs/heads/<branch> on origin; for a fork
+# PR that branch lives in the fork, and a same-named origin branch would be
+# reviewed and pushed instead.
+[ "$(jq -r '.isCrossRepository' <<<"$PR_META")" != "true" ] \
+  || die "PR #$PR_NUMBER is a cross-repository (fork) PR; the pipeline can only work on branches in $CURRENT_REPO"
 
 PR_CONTEXT="PR #$PR_NUMBER: $PR_TITLE
 Branch: $BRANCH (base: $BASE_BRANCH)
@@ -257,6 +290,7 @@ row "Repo" "$CURRENT_REPO"
 row "Branch" "$BRANCH -> $BASE_BRANCH"
 row "Model" "$MODEL_DESC"
 row "Loops" "max $MAX_ITER review rounds, $MAX_CI_FIXES CI fixes"
+row "Timeout" "$FIX_TIMEOUT per codex fix step"
 row "Run dir" "$RUN_ROOT"
 hr
 
@@ -302,7 +336,7 @@ envrc_stamp() {
   (cd "$WORKTREE" && find . -name .envrc -not -path './.git/*' -exec shasum {} \; 2>/dev/null | sort)
 }
 
-if [ "$USE_DIRENV" -eq 1 ] && find "$WORKTREE" -name .envrc -print -quit | grep -q .; then
+if [ "$USE_DIRENV" -eq 1 ] && find "$WORKTREE" -name .envrc -not -path "$WORKTREE/.git/*" -print -quit | grep -q .; then
   (cd "$WORKTREE" && direnv allow)
   DIRENV_ACTIVE=1
   ENVRC_STAMP="$(envrc_stamp)"
@@ -319,6 +353,7 @@ check_envrc() {
   notify "direnv" ".envrc wurde veraendert, Freigabe noetig"
   echo "${C_RED}A .envrc file changed inside the worktree.${C_RESET}" >&2
   git -C "$WORKTREE" diff "$HEAD_SHA" -- .envrc ':(glob)**/.envrc' >&2 || true
+  require_tty "the .envrc approval gate"
   printf 'Run direnv allow for the changed .envrc? [y/N] '
   read -r reply
   if [ "$reply" = "y" ] || [ "$reply" = "Y" ]; then
@@ -330,12 +365,69 @@ check_envrc() {
   fi
 }
 
+# shellcheck disable=SC2329  # invoked indirectly via run_with_timeout "$@"
 run_in_worktree() {
   if [ "$DIRENV_ACTIVE" -eq 1 ]; then
     (cd "$WORKTREE" && direnv exec "$WORKTREE" "$@")
   else
     (cd "$WORKTREE" && "$@")
   fi
+}
+
+# --- Timeouts -----------------------------------------------------------------------
+
+child_pids() {
+  local pid="$1"
+  ps -axo pid=,ppid= | awk -v p="$pid" '$2 == p { print $1 }'
+}
+
+kill_tree() {
+  local pid="$1"
+  local children child
+  children="$(child_pids "$pid" || true)"
+  for child in $children; do
+    kill_tree "$child"
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+force_kill_tree() {
+  local pid="$1"
+  local children child
+  children="$(child_pids "$pid" || true)"
+  for child in $children; do
+    force_kill_tree "$child"
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  local label="$2"
+  shift 2
+  if [ "$seconds" -eq 0 ]; then
+    "$@"
+    return
+  fi
+
+  "$@" &
+  local child="$!"
+  local elapsed=0
+  while kill -0 "$child" 2>/dev/null; do
+    if [ "$elapsed" -ge "$seconds" ]; then
+      echo "error: codex step timed out after $label; terminating process tree rooted at $child" >&2
+      kill_tree "$child"
+      sleep 2
+      if kill -0 "$child" 2>/dev/null; then
+        force_kill_tree "$child"
+      fi
+      wait "$child" 2>/dev/null || true
+      return 124
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  wait "$child"
 }
 
 # --- Codex session plumbing -------------------------------------------------------
@@ -366,10 +458,13 @@ codex_new() {
   LAST_MSG="$MSG_DIR/$tag.md"
   check_envrc
   set +e
-  run_in_worktree codex exec ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} \
+  # PIPESTATUS[0] is run_with_timeout's return: codex's exit code, or 124 on timeout.
+  run_with_timeout "$FIX_TIMEOUT_SECONDS" "$FIX_TIMEOUT" \
+    run_in_worktree codex exec ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} \
     -o "$LAST_MSG" "$prompt" </dev/null 2>&1 | tee "$LOG_DIR/$tag.log"
   rc="${PIPESTATUS[0]}"
   set -e
+  [ "$rc" -ne 124 ] || die "codex fix step timed out after $FIX_TIMEOUT (--fix-timeout; 0 disables), see $LOG_DIR/$tag.log"
   [ "$rc" -eq 0 ] || die "codex exec failed with exit $rc, see $LOG_DIR/$tag.log"
   [ -s "$LAST_MSG" ] || die "codex produced no final message, see $LOG_DIR/$tag.log"
   capture_session_id || die "could not find the Codex session for $WORKTREE under ~/.codex/sessions"
@@ -381,10 +476,12 @@ codex_resume() {
   LAST_MSG="$MSG_DIR/$tag.md"
   check_envrc
   set +e
-  run_in_worktree codex exec resume "$SESSION_ID" ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} \
+  run_with_timeout "$FIX_TIMEOUT_SECONDS" "$FIX_TIMEOUT" \
+    run_in_worktree codex exec resume "$SESSION_ID" ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} \
     -o "$LAST_MSG" "$prompt" </dev/null 2>&1 | tee "$LOG_DIR/$tag.log"
   rc="${PIPESTATUS[0]}"
   set -e
+  [ "$rc" -ne 124 ] || die "codex fix step timed out after $FIX_TIMEOUT (--fix-timeout; 0 disables), see $LOG_DIR/$tag.log"
   [ "$rc" -eq 0 ] || die "codex exec resume failed with exit $rc, see $LOG_DIR/$tag.log"
   [ -s "$LAST_MSG" ] || die "codex produced no final message, see $LOG_DIR/$tag.log"
 }
@@ -399,7 +496,10 @@ Standing rules for every step:
 - Make reasonable technical decisions yourself.
 - Only for product decisions you cannot responsibly make yourself (data semantics, user-visible policy, migration of existing data): stop and end your final message with a line that is exactly:
 OPEN QUESTIONS:
-followed by short numbered questions. Use this marker for nothing else. You will receive the user's answers and can then continue."
+followed by short numbered questions. Use this marker for nothing else. You will receive the user's answers and can then continue.
+- If an external review finding rated Blocker or Critical is factually wrong and no code change is warranted, do not change code just to satisfy the review. Instead end your final message with a line that is exactly:
+DISPUTED FINDINGS:
+followed by short numbered rebuttals, one per disputed finding, each naming the finding and why it is wrong. Use this marker only for Blocker/Critical findings you are confident are incorrect, never to avoid work, and never together with code changes that already resolve the finding."
 
 # First call carries the standing rules and PR context; later calls resume the
 # same session, so context carries through all CI and review fix rounds.
@@ -422,6 +522,17 @@ $prompt"
 
 # --- Gates ------------------------------------------------------------------------
 
+# Gates read answers from the terminal. Without one, stdin hits EOF and the
+# gate would spin or die without explanation, so abort clearly instead.
+# cleanup() suppresses the failure notification for exit 2, hence the
+# explicit notify here.
+require_tty() {
+  [ -t 0 ] && return 0
+  notify "Gate" "Interaktive Eingabe noetig, aber kein Terminal"
+  echo "error: $* requires interactive input but stdin is not a terminal; rerun in an interactive terminal" >&2
+  exit 2
+}
+
 # Codex ends its final message with an "OPEN QUESTIONS:" line when it needs a
 # product decision. Surface the questions, collect answers, resume the session.
 question_gate() {
@@ -433,6 +544,7 @@ question_gate() {
     hr
     sed -n '/^OPEN QUESTIONS:/,$p' "$LAST_MSG"
     hr
+    require_tty "the open-questions gate"
     echo "Answer the questions. Finish with an empty line; 'q' aborts the pipeline."
     answers=""
     while IFS= read -r line; do
@@ -455,6 +567,63 @@ Continue with the current step using these decisions. All rules from the initial
   done
 }
 
+# Codex ends a fix round with "DISPUTED FINDINGS:" when it believes the
+# remaining Blocker/Critical findings are wrong and no code change is
+# warranted. Only reached when the round produced no commits; a human
+# decides: accept the rebuttals (run finishes), reply into the session,
+# or abort. Only this human keystroke can accept, so the no-commit stop
+# (exit 5) is not weakened.
+DISPUTE_ACCEPTED=0
+
+dispute_gate() {
+  local tag_base="$1" pre_sha="$2" n=0 reply line
+  while :; do
+    n=$((n + 1))
+    notify "Disputed findings" "Codex haelt verbleibende Findings fuer falsch"
+    echo
+    hr
+    sed -n '/^DISPUTED FINDINGS:/,$p' "$LAST_MSG"
+    hr
+    require_tty "the dispute gate"
+    echo "Codex disputes the remaining Blocker/Critical findings instead of changing code."
+    echo "Type 'a' to accept the rebuttals and finish the run, 'q' to abort,"
+    echo "or type a reply to Codex (finish with an empty line)."
+    reply=""
+    while IFS= read -r line; do
+      if [ -z "$reply" ] && [ "$line" = "a" ]; then
+        DISPUTE_ACCEPTED=1
+        return 0
+      fi
+      if [ -z "$reply" ] && [ "$line" = "q" ]; then
+        echo "Aborted at the dispute gate." >&2
+        exit 2
+      fi
+      [ -n "$line" ] || break
+      reply="$reply$line
+"
+    done
+    if [ -z "$reply" ]; then
+      echo "No input given; the disputed findings are shown again."
+      continue
+    fi
+    codex_resume "$tag_base-dispute-$n" "The user does not accept your dispute as-is and replies:
+
+$reply
+Reconsider the disputed findings with this input. If the user is right, implement the fix and commit. If you still believe a finding is wrong, explain why and end your message with the DISPUTED FINDINGS: marker again. All rules from the initial instructions still apply."
+    question_gate "$tag_base-dispute-$n"
+    ensure_committed "$tag_base-dispute-$n"
+    if [ "$(git -C "$WORKTREE" rev-parse HEAD)" != "$pre_sha" ]; then
+      return 0
+    fi
+    if ! grep -q '^DISPUTED FINDINGS:' "$LAST_MSG"; then
+      notify "Festgefahren" "Dispute-Runde ohne Commits und ohne Dispute"
+      echo "Codex neither fixed nor still disputes the remaining findings; a human is needed: $PR_URL" >&2
+      trap - EXIT
+      exit 5
+    fi
+  done
+}
+
 ensure_committed() {
   local tag="$1"
   if [ -n "$(git -C "$WORKTREE" status --porcelain)" ]; then
@@ -464,8 +633,35 @@ ensure_committed() {
   [ -z "$(git -C "$WORKTREE" status --porcelain)" ] || die "worktree still has uncommitted changes; inspect $WORKTREE"
 }
 
+# After a push, gh pr checks can briefly still report the previous head's
+# completed checks, so a red new commit could read green. Wait until GitHub
+# reports the pushed sha as the PR head.
 push_branch() {
+  local pushed_sha remote_sha waited=0
+  pushed_sha="$(git -C "$WORKTREE" rev-parse HEAD)"
   git -C "$WORKTREE" push -q origin "HEAD:refs/heads/$BRANCH"
+  while :; do
+    remote_sha="$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid 2>/dev/null || true)"
+    [ "$remote_sha" = "$pushed_sha" ] && return 0
+    [ "$waited" -lt 180 ] || die "GitHub still reports PR head $remote_sha instead of the pushed $pushed_sha after ${waited}s; is someone else pushing to $BRANCH?"
+    echo "${C_DIM}waiting for GitHub to register the pushed head...${C_RESET}"
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
+ROUND_LOG=""
+CI_FIX_TOTAL=0
+
+record_round() {
+  local label="$1" pre="$2" commits
+  commits="$(git -C "$WORKTREE" log --oneline "$pre..HEAD" 2>/dev/null || true)"
+  [ -n "$commits" ] || return 0
+  ROUND_LOG="$ROUND_LOG$label:
+$commits
+
+"
+  printf '%s:\n%s\n\n' "$label" "$commits" >> "$LOG_DIR/rounds.log"
 }
 
 # --- CI ---------------------------------------------------------------------------
@@ -502,7 +698,7 @@ ci_status() {
 }
 
 ensure_ci_green() {
-  local attempt=0 status fails
+  local attempt=0 status fails pre_sha
   while :; do
     echo "${C_DIM}waiting for CI on PR #$PR_NUMBER...${C_RESET}"
     status="$(ci_status)"
@@ -522,6 +718,7 @@ ensure_ci_green() {
         fi
         echo "${C_RED}CI red; starting fix attempt $attempt/$MAX_CI_FIXES.${C_RESET}"
         fails="$(gh pr checks "$PR_NUMBER" --json name,bucket,workflow,link,description 2>/dev/null | jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")]')"
+        pre_sha="$(git -C "$WORKTREE" rev-parse HEAD)"
         codex_call "ci-fix-$attempt" "CI on PR #$PR_NUMBER is red. Failing checks as JSON:
 
 $fails
@@ -529,6 +726,8 @@ $fails
 Inspect the failures with gh (for example: gh run view <run-id> --log-failed; the run id is the number after /runs/ in the link). Reproduce locally where practical, fix the problems, run the affected checks locally, and commit. Do not push."
         question_gate "ci-fix-$attempt"
         ensure_committed "ci-fix-$attempt"
+        CI_FIX_TOTAL=$((CI_FIX_TOTAL + 1))
+        record_round "CI fix $CI_FIX_TOTAL" "$pre_sha"
         push_branch
         ;;
     esac
@@ -552,14 +751,29 @@ REVIEW_ARGS=()
 [ -z "$REVIEW_MODEL" ] || REVIEW_ARGS+=(--model "$REVIEW_MODEL")
 [ -z "$REVIEW_EFFORT" ] || REVIEW_ARGS+=(--effort "$REVIEW_EFFORT")
 
+list_review_runs() {
+  find "$HOME/.cache/pr-codex-review" -mindepth 1 -maxdepth 1 -type d \
+    -name "$SAFE_REPO-pr-$PR_NUMBER-*" 2>/dev/null | sort
+}
+
 while [ "$ITERATION" -lt "$MAX_ITER" ]; do
   ITERATION=$((ITERATION + 1))
   step "Review round $ITERATION/$MAX_ITER"
+  RUNS_BEFORE="$(list_review_runs)"
   pr-codex-review "$PR_NUMBER" ${REVIEW_ARGS[@]+"${REVIEW_ARGS[@]}"} \
     || die "pr-codex-review failed; fix the review setup and rerun"
 
-  # shellcheck disable=SC2012  # mtime ordering wanted; run dir names contain no newlines
-  REVIEW_RUN="$(ls -td "$HOME/.cache/pr-codex-review/$SAFE_REPO-pr-$PR_NUMBER-"* 2>/dev/null | head -1)"
+  # The run dir this review created is the one added since the snapshot; a
+  # concurrent manual review would make this ambiguous, hence the fallback
+  # (the head_sha check below catches a wrong pick).
+  NEW_RUNS="$(comm -13 <(printf '%s\n' "$RUNS_BEFORE") <(list_review_runs) | grep . || true)"
+  if [ "$(printf '%s\n' "$NEW_RUNS" | grep -c .)" -eq 1 ]; then
+    REVIEW_RUN="$NEW_RUNS"
+  else
+    echo "warning: could not identify exactly one new pr-codex-review run dir; falling back to the newest" >&2
+    # shellcheck disable=SC2012  # mtime ordering wanted; run dir names contain no newlines
+    REVIEW_RUN="$(ls -td "$HOME/.cache/pr-codex-review/$SAFE_REPO-pr-$PR_NUMBER-"* 2>/dev/null | head -1)"
+  fi
   FINDINGS_JSON="$REVIEW_RUN/output/findings.json"
   [ -f "$FINDINGS_JSON" ] || die "no findings.json in $REVIEW_RUN (pr-codex-review >= 1.2.0 required)"
   REVIEWED_SHA="$(jq -r '.head_sha' "$FINDINGS_JSON")"
@@ -589,12 +803,22 @@ $(cat "$REVIEW_RUN/output/final-pr-comment.md")"
   ensure_committed "fix-round-$ITERATION"
 
   if [ "$(git -C "$WORKTREE" rev-parse HEAD)" = "$PRE_FIX_SHA" ]; then
-    notify "Festgefahren" "Fix-Runde $ITERATION hat nichts geaendert"
-    echo "Fix round $ITERATION produced no commits although findings remain; a human is needed: $PR_URL" >&2
-    trap - EXIT
-    exit 5
+    if grep -q '^DISPUTED FINDINGS:' "$LAST_MSG"; then
+      dispute_gate "fix-round-$ITERATION" "$PRE_FIX_SHA"
+      if [ "$DISPUTE_ACCEPTED" -eq 1 ]; then
+        CONVERGED=1
+        break
+      fi
+      # dispute_gate only returns unaccepted when new commits exist.
+    else
+      notify "Festgefahren" "Fix-Runde $ITERATION hat nichts geaendert"
+      echo "Fix round $ITERATION produced no commits although findings remain; a human is needed: $PR_URL" >&2
+      trap - EXIT
+      exit 5
+    fi
   fi
 
+  record_round "Review fix round $ITERATION" "$PRE_FIX_SHA"
   push_branch
   if ! ensure_ci_green; then
     notify "CI rot" "PR #$PR_NUMBER nach Fix-Runde $ITERATION weiter rot"
@@ -612,10 +836,21 @@ row "PR" "${C_BOLD}#$PR_NUMBER${C_RESET} $PR_URL"
 row "Branch" "$BRANCH"
 row "Rounds" "$ITERATION review round(s)"
 row "Duration" "$(format_duration "$(( $(date +%s) - SCRIPT_STARTED ))")"
+if [ -n "$ROUND_LOG" ]; then
+  echo "  Commits per round:"
+  printf '%s' "$ROUND_LOG" | sed 's/^\(.\)/    \1/'
+fi
 if [ "$CONVERGED" -eq 1 ]; then
-  row "Result" "${C_GREEN}review clean, CI green${C_RESET}"
-  hr
-  notify "Fertig" "PR #$PR_NUMBER ist bereit fuer den manuellen Test"
+  if [ "$DISPUTE_ACCEPTED" -eq 1 ]; then
+    row "Result" "${C_GREEN}CI green; remaining findings disputed by Codex, accepted by you${C_RESET}"
+    echo "  Note: the review comment on the PR still lists the disputed findings."
+    hr
+    notify "Fertig" "PR #$PR_NUMBER fertig; Disputes akzeptiert, bereit fuer den manuellen Test"
+  else
+    row "Result" "${C_GREEN}review clean, CI green${C_RESET}"
+    hr
+    notify "Fertig" "PR #$PR_NUMBER ist bereit fuer den manuellen Test"
+  fi
   exit 0
 fi
 row "Result" "${C_RED}not converged after $MAX_ITER review rounds${C_RESET}"
