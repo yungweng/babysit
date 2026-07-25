@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.6.1"
 SCRIPT_STARTED="$(date +%s)"
 
 usage() {
@@ -809,12 +809,20 @@ ensure_committed() {
 # commit could read green. Wait until GitHub reports the pushed sha as the
 # PR head.
 push_branch() {
-  local pushed_sha remote_sha waited=0
+  local pushed_sha remote_sha waited=0 push_rc=0
   pushed_sha="$(git -C "$WORKTREE" rev-parse HEAD)"
-  git -C "$WORKTREE" push -q origin "HEAD:refs/heads/$BRANCH"
+  # Pre-push hooks (e.g. lefthook) spam the terminal and can fail spuriously
+  # when they race a push Codex already made; keep their output in the log
+  # and only surface it when the push failed and the sha never arrived.
+  git -C "$WORKTREE" push -q origin "HEAD:refs/heads/$BRANCH" \
+    > "$LOG_DIR/push-last.log" 2>&1 || push_rc=$?
   while :; do
     remote_sha="$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid 2>/dev/null || true)"
     [ "$remote_sha" = "$pushed_sha" ] && return 0
+    if [ "$push_rc" -ne 0 ]; then
+      cat "$LOG_DIR/push-last.log" >&2
+      die "git push failed (exit $push_rc) and GitHub does not have $pushed_sha; see output above"
+    fi
     [ "$waited" -lt 180 ] || die "GitHub still reports PR head $remote_sha instead of the pushed $pushed_sha after ${waited}s; is someone else pushing to $BRANCH?"
     echo "${C_DIM}waiting for GitHub to register the pushed head...${C_RESET}"
     sleep 5
