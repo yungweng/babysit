@@ -354,20 +354,35 @@ trap cleanup EXIT
 
 DIRENV_ACTIVE=0
 ENVRC_STAMP=""
+ENVRC_BASELINE_FILE="$RUN_ROOT/envrc-baseline"
 
 envrc_stamp() {
-  (cd "$WORKTREE" && find . -name .envrc -not -path './.git/*' -exec shasum {} \; 2>/dev/null | sort)
+  (
+    cd "$WORKTREE"
+    find . -name .envrc -not -path './.git/*' -print 2>/dev/null \
+      | while IFS= read -r path; do
+          repo_path="${path#./}"
+          if grep -Fqx "$path" "$ENVRC_BASELINE_FILE" \
+            || ! git check-ignore -q -- "$repo_path"; then
+            shasum "$path"
+          fi
+        done \
+      | sort
+  )
 }
 
 if [ "$USE_DIRENV" -eq 1 ] && find "$WORKTREE" -name .envrc -not -path "$WORKTREE/.git/*" -print -quit | grep -q .; then
+  (cd "$WORKTREE" && find . -name .envrc -not -path './.git/*' -print 2>/dev/null | sort) \
+    > "$ENVRC_BASELINE_FILE"
   (cd "$WORKTREE" && direnv allow)
   DIRENV_ACTIVE=1
   ENVRC_STAMP="$(envrc_stamp)"
   echo "direnv:   allowed"
 fi
 
-# The PR-head .envrc was allowed above. If a later Codex step edits any
-# .envrc, executing it automatically would run unreviewed code, so gate it.
+# The PR-head .envrc files were allowed above. Keep watching those files and
+# new non-ignored .envrc files, but skip files generated later in ignored
+# caches such as .devbox; direnv never approved or loads those cache files.
 check_envrc() {
   [ "$DIRENV_ACTIVE" -eq 1 ] || return 0
   local now reply

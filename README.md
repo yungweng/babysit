@@ -118,7 +118,7 @@ Failed runs always keep it for inspection.
 - **Do not push to the PR branch manually while a run is active.** `pr-codex-review` refuses to post when the PR head moves during its review, and the pipeline treats that as a hard failure. The Codex session pushes during fix rounds; the pipeline re-pushes as a safety net and waits until GitHub reports the new head before reading checks, so a stale check result cannot pass as green.
 - The pipeline refuses to start when your checkout of the PR branch has uncommitted changes, or when the local branch differs from `origin`: it reviews the pushed head and would otherwise silently ignore your local work.
 - Cross-repository (fork) PRs are refused at start: the pipeline fetches and pushes `refs/heads/<branch>` on `origin`, which for a fork PR would hit the wrong branch.
-- If a Codex step changes any `.envrc`, the pipeline stops and asks before running `direnv allow` on the changed file.
+- If a Codex step changes a `.envrc` that existed when the run started, or creates a new non-ignored `.envrc`, the pipeline stops and asks before running `direnv allow`. Generated `.envrc` files that appear later inside Git-ignored caches such as `.devbox/` do not trigger the gate.
 - If a fix round ends with findings still open but no new commits, the pipeline stops (exit 5) instead of looping on a stuck state; the only exception is an explicit `DISPUTED FINDINGS:` block, which hands the decision to you (see Dispute Gate).
 - Codex fix steps are killed after `--fix-timeout` (default 2h), so a hung session cannot stall the run silently.
 - Gates abort with exit 2 when stdin is not a terminal instead of hanging or spinning.
