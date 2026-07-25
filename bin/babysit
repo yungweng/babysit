@@ -7,7 +7,7 @@ SCRIPT_STARTED="$(date +%s)"
 usage() {
   cat <<'EOF'
 Usage:
-  pr-codex-pipeline [options] [pr-number|pr-url] [extra context...]
+  babysit [options] [pr-number|pr-url] [extra context...]
 
 Runs the review-fix-CI cycle for an existing GitHub PR until pr-codex-review
 reports zero Blockers and Critical findings and CI is green:
@@ -58,9 +58,9 @@ Exit codes:
   5  a fix round produced no changes although findings remain
 
 Examples:
-  pr-codex-pipeline                  # PR of the current branch
-  pr-codex-pipeline 1811
-  pr-codex-pipeline 1811 --effort high "Focus on the time-tracking module"
+  babysit                  # PR of the current branch
+  babysit 1811
+  babysit 1811 --effort high "Focus on the time-tracking module"
 EOF
 }
 
@@ -108,7 +108,7 @@ while [ "$#" -gt 0 ]; do
     --no-notify)      NOTIFY=0; shift ;;
     --no-direnv)      USE_DIRENV=0; shift ;;
     --keep-worktree)  CLEANUP=0; shift ;;
-    --version)        echo "pr-codex-pipeline $VERSION"; exit 0 ;;
+    --version)        echo "babysit $VERSION"; exit 0 ;;
     -h|--help)        usage; exit 0 ;;
     -*)               die "unknown option: $1" ;;
     *)
@@ -202,7 +202,7 @@ notify() {
   [ "$NOTIFY" -eq 1 ] || return 0
   osascript \
     -e 'on run argv' \
-    -e 'display notification (item 2 of argv) with title "pr-codex-pipeline" subtitle (item 1 of argv) sound name "Glass"' \
+    -e 'display notification (item 2 of argv) with title "babysit" subtitle (item 1 of argv) sound name "Glass"' \
     -e 'end run' \
     "$1" "$2" >/dev/null 2>&1 || true
 }
@@ -261,7 +261,7 @@ fi
 # --- Run directory and worktree ------------------------------------------------
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
-RUN_ROOT="$HOME/.cache/pr-codex-pipeline/$SAFE_REPO-pr-$PR_NUMBER-$RUN_ID"
+RUN_ROOT="$HOME/.cache/babysit/$SAFE_REPO-pr-$PR_NUMBER-$RUN_ID"
 WORKTREE="$RUN_ROOT/worktree"
 LOG_DIR="$RUN_ROOT/logs"
 MSG_DIR="$RUN_ROOT/messages"
@@ -271,7 +271,7 @@ while IFS= read -r old_dir; do
   [ "$old_dir" = "$RUN_ROOT" ] && continue
   git -C "$REPO_ROOT" worktree remove "$old_dir/worktree" --force >/dev/null 2>&1 || true
   rm -rf "$old_dir"
-done < <(find "$HOME/.cache/pr-codex-pipeline" -mindepth 1 -maxdepth 1 -type d -mtime +7 2>/dev/null)
+done < <(find "$HOME/.cache/babysit" -mindepth 1 -maxdepth 1 -type d -mtime +7 2>/dev/null)
 git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
 
 MODEL_DESC="codex default"
@@ -283,7 +283,7 @@ elif [ -n "$EFFORT" ]; then
   MODEL_DESC="codex default (effort $EFFORT)"
 fi
 
-echo "${C_BOLD}pr-codex-pipeline v$VERSION${C_RESET}"
+echo "${C_BOLD}babysit v$VERSION${C_RESET}"
 hr
 row "PR" "${C_BOLD}#$PR_NUMBER $PR_TITLE${C_RESET}"
 row "Repo" "$CURRENT_REPO"

@@ -1,8 +1,8 @@
-# pr-codex-pipeline
+# babysit
 
 You implement, the pipeline iterates: review, fix, CI, repeat, until the PR is clean. Then you get a notification and do the manual test.
 
-`pr-codex-pipeline` automates the loop after the first implementation of a PR exists. It waits for CI and lets a Codex session fix red checks, runs [`pr-codex-review`](https://github.com/yungweng/pr-codex-review), and feeds the review findings back into the same Codex session for a fix round. The loop ends when a review reports zero Blockers and Critical findings and CI is green. Deliberately out of scope: picking issues, planning, and the first implementation. That part stays with you.
+`babysit` automates the loop after the first implementation of a PR exists. It waits for CI and lets a Codex session fix red checks, runs [`pr-codex-review`](https://github.com/yungweng/pr-codex-review), and feeds the review findings back into the same Codex session for a fix round. The loop ends when a review reports zero Blockers and Critical findings and CI is green. Deliberately out of scope: picking issues, planning, and the first implementation. That part stays with you.
 
 ## Requirements
 
@@ -20,7 +20,7 @@ The Codex fix sessions inherit your `~/.codex/config.toml`. They must be allowed
 ## Install
 
 ```bash
-ln -sf "$PWD/bin/pr-codex-pipeline" ~/.local/bin/pr-codex-pipeline
+ln -sf "$PWD/bin/babysit" ~/.local/bin/babysit
 ```
 
 ## Usage
@@ -28,15 +28,15 @@ ln -sf "$PWD/bin/pr-codex-pipeline" ~/.local/bin/pr-codex-pipeline
 From inside the repo checkout, with the PR's implementation committed and pushed:
 
 ```bash
-pr-codex-pipeline                 # PR of the current branch
-pr-codex-pipeline 1811            # explicit PR number
-pr-codex-pipeline https://github.com/owner/repo/pull/1811
+babysit                 # PR of the current branch
+babysit 1811            # explicit PR number
+babysit https://github.com/owner/repo/pull/1811
 ```
 
 Extra positional text becomes additional context for the Codex fix session:
 
 ```bash
-pr-codex-pipeline 1811 --effort high "Focus on the time-tracking module"
+babysit 1811 --effort high "Focus on the time-tracking module"
 ```
 
 ## What It Does
@@ -119,7 +119,7 @@ Failed runs always keep it for inspection.
 Each run writes logs and Codex messages under:
 
 ```text
-~/.cache/pr-codex-pipeline/<repo>-pr-<number>-<timestamp>/
+~/.cache/babysit/<repo>-pr-<number>-<timestamp>/
   worktree/    dedicated git worktree on the PR head (removed on success)
   logs/        codex and CI logs per phase
   messages/    each fix round's final Codex message

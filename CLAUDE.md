@@ -4,12 +4,12 @@ Guidance for coding agents working in this repository.
 
 ## What this is
 
-A single Bash script (`bin/pr-codex-pipeline`) that automates the iterate-until-clean part of a PR: wait for CI, let a resumable `codex exec` session fix red checks, run `pr-codex-review`, feed the findings back as fix rounds, and stop when `findings.json` reports zero Blockers and Critical findings. Issue selection, planning, and the first implementation are deliberately NOT part of this tool; the user does those. Gates (OPEN QUESTIONS from Codex, DISPUTED FINDINGS, `.envrc` changes) block in the terminal and fire macOS notifications; without an interactive terminal they abort (exit 2).
+A single Bash script (`bin/babysit`) that automates the iterate-until-clean part of a PR: wait for CI, let a resumable `codex exec` session fix red checks, run `pr-codex-review`, feed the findings back as fix rounds, and stop when `findings.json` reports zero Blockers and Critical findings. Issue selection, planning, and the first implementation are deliberately NOT part of this tool; the user does those. Gates (OPEN QUESTIONS from Codex, DISPUTED FINDINGS, `.envrc` changes) block in the terminal and fire macOS notifications; without an interactive terminal they abort (exit 2).
 
 ## Layout
 
 ```text
-bin/pr-codex-pipeline     the entire tool
+bin/babysit               the entire tool
 README.md                 user-facing docs, keep in sync with --help
 .github/workflows/ci.yml  CI: bash -n, shellcheck, --help, --version
 ```
@@ -28,7 +28,7 @@ README.md                 user-facing docs, keep in sync with --help
 ## Checks before committing
 
 ```bash
-bash -n bin/pr-codex-pipeline
-shellcheck bin/pr-codex-pipeline
-/bin/bash bin/pr-codex-pipeline --help
+bash -n bin/babysit
+shellcheck bin/babysit
+/bin/bash bin/babysit --help
 ```

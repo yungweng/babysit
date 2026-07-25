@@ -10,10 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax check
-        run: bash -n bin/pr-codex-pipeline
+        run: bash -n bin/babysit
       - name: Shellcheck
-        run: shellcheck bin/pr-codex-pipeline
+        run: shellcheck bin/babysit
       - name: Help renders
-        run: bash bin/pr-codex-pipeline --help
+        run: bash bin/babysit --help
       - name: Version flag
-        run: bash bin/pr-codex-pipeline --version
+        run: bash bin/babysit --version
