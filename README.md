@@ -2,7 +2,7 @@
 
 You implement, `babysit` iterates: review, fix, CI, repeat, until the PR is clean. Then you get a notification and do the manual test.
 
-`babysit` automates the loop after the first implementation of a PR exists. It runs [`pr-codex-review`](https://github.com/yungweng/pr-codex-review) and feeds the review findings into a resumable Codex session, which checks each finding (real issue or intended?), fixes the real ones, commits, pushes, and babysits CI until it is green. After each fix round the pipeline posts a comment to the PR logging what was fixed. The loop ends when a review reports zero Blockers and Critical findings and CI is green. Deliberately out of scope: picking issues, planning, and the first implementation. That part stays with you.
+`babysit` automates the loop after the first implementation of a PR exists. It runs [`pr-codex-review`](https://github.com/yungweng/pr-codex-review) and feeds the review findings into a resumable Codex session, which checks each finding (real issue or intended?), fixes the real ones, commits, and pushes. Watching CI is the pipeline's job, not Codex's, and the next review runs in the background while the pipeline waits for the checks. After each fix round the pipeline posts a comment to the PR logging what was fixed. The loop ends when a review reports zero Blockers and Critical findings and CI is green. Deliberately out of scope: picking issues, planning, and the first implementation. That part stays with you.
 
 ## Requirements
 
@@ -15,9 +15,15 @@ pr-codex-review  (>= 1.2.0, needed for findings.json)
 direnv           (optional, skip with --no-direnv)
 ```
 
-The Codex fix sessions run with `--dangerously-bypass-approvals-and-sandbox` by default: they must run tests, `git push`, and watch CI via `gh`, all unattended, and a sandboxed or approval-gated `codex exec` would silently skip those commands. Be aware what that means: an unattended agent with full file and network access on your machine, for up to `--fix-timeout` per step. Pass `--sandboxed` to use your `~/.codex/config.toml` defaults instead; then your config must allow commands, network, and push, or fix rounds will fail. The review side is unaffected: `pr-codex-review` manages its own (read-only) sandbox.
+The Codex fix sessions run with `--dangerously-bypass-approvals-and-sandbox` by default: they must run tests, use `gh`, and `git push`, all unattended, and a sandboxed or approval-gated `codex exec` would silently skip those commands. Be aware what that means: an unattended agent with full file and network access on your machine, for up to `--fix-timeout` per step. Pass `--sandboxed` to use your `~/.codex/config.toml` defaults instead; then your config must allow commands, network, and push, or fix rounds will fail. The review side is unaffected: `pr-codex-review` manages its own (read-only) sandbox.
 
 ## Install
+
+```bash
+brew install yungweng/tap/babysit
+```
+
+Or from a checkout:
 
 ```bash
 ln -sf "$PWD/bin/babysit" ~/.local/bin/babysit

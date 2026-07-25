@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 SCRIPT_STARTED="$(date +%s)"
 
 usage() {
@@ -12,20 +12,21 @@ Usage:
 Runs the review-fix cycle for an existing GitHub PR until pr-codex-review
 reports zero Blockers and Critical findings and CI is green:
 
-  1. Wait for CI; red checks go to a Codex fix session that fixes, pushes,
-     and babysits the PR until CI is green (up to --max-ci-fixes attempts).
-  2. Run pr-codex-review, which posts its review comment to the PR.
-  3. Zero Blockers and Critical -> done, notification.
+  1. Run pr-codex-review in the background (it posts its review comment to
+     the PR) while waiting for CI. Red checks go to a Codex fix session that
+     fixes and pushes (up to --max-ci-fixes attempts); the review of the
+     outgoing head is then discarded and rerun.
+  2. Zero Blockers and Critical -> done, notification.
      Otherwise -> Codex checks each finding (real issue or intended?),
-     fixes the real ones, commits, pushes, and babysits CI until green.
-     The pipeline then posts a PR comment logging what was fixed and goes
-     back to 2 (up to --max-iter rounds).
+     fixes the real ones, commits, and pushes. The pipeline posts a PR
+     comment logging what was fixed and goes back to 1 (up to --max-iter
+     rounds). Waiting for CI is the pipeline's job, never Codex's.
 
 Without a PR argument the PR of the current branch is used. Any extra
 positional text is handed to the Codex fix session as additional context.
 
 The Codex fix sessions run with --dangerously-bypass-approvals-and-sandbox
-by default: they must run tests, push, and watch CI via gh, all unattended.
+by default: they must run tests, use gh, and push, all unattended.
 Pass --sandboxed to use your codex sandbox/approval defaults instead.
 
 The PR's implementation must be committed and pushed before starting: the
@@ -381,9 +382,14 @@ fi
 git worktree add --quiet --detach "$WORKTREE" "$HEAD_SHA"
 echo "Worktree: $WORKTREE (PR head $HEAD_SHA)"
 
+# Set while a background pr-codex-review runs (see start_review).
+REVIEW_PID=""
+
 # shellcheck disable=SC2329,SC2317  # invoked via the EXIT trap below
 cleanup() {
   local rc=$?
+  # A backgrounded review would otherwise outlive the pipeline.
+  [ -z "$REVIEW_PID" ] || kill_tree "$REVIEW_PID" 2>/dev/null || true
   if [ "$rc" -eq 0 ] && [ "$CLEANUP" -eq 1 ] && [ -d "$WORKTREE" ]; then
     git -C "$REPO_ROOT" worktree remove "$WORKTREE" --force >/dev/null 2>&1 || true
   elif [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
@@ -853,6 +859,104 @@ post_fix_comment() {
     || echo "warning: could not post the fix-log comment to PR #$PR_NUMBER" >&2
 }
 
+# --- Review -----------------------------------------------------------------------
+
+REVIEW_ARGS=()
+[ -z "$REVIEWERS" ] || REVIEW_ARGS+=(-n "$REVIEWERS")
+[ -z "$REVIEW_MODEL" ] || REVIEW_ARGS+=(--model "$REVIEW_MODEL")
+[ -z "$REVIEW_EFFORT" ] || REVIEW_ARGS+=(--effort "$REVIEW_EFFORT")
+
+list_review_runs() {
+  find "$HOME/.cache/pr-codex-review" -mindepth 1 -maxdepth 1 -type d \
+    -name "$SAFE_REPO-pr-$PR_NUMBER-*" 2>/dev/null | sort
+}
+
+# A review needs the pushed PR head, not green CI, so it runs in the background
+# while ensure_ci_green watches the checks. It must never overlap a Codex
+# session: a CI fix moves the head sha out from under the findings, which is
+# why ensure_ci_green calls discard_review before starting one.
+REVIEW_ROUND=0
+REVIEW_STARTED=0
+RUNS_BEFORE=""
+
+start_review() {
+  REVIEW_ROUND="$1"
+  RUNS_BEFORE="$(list_review_runs)"
+  REVIEW_STARTED="$(date +%s)"
+  # pr-codex-review prints its own banner and the full review comment, which
+  # duplicates what babysit already shows; keep all of it in the log.
+  pr-codex-review "$PR_NUMBER" ${REVIEW_ARGS[@]+"${REVIEW_ARGS[@]}"} \
+    >"$LOG_DIR/review-$REVIEW_ROUND.log" 2>&1 </dev/null &
+  REVIEW_PID="$!"
+}
+
+# Waits for an already-running background process while ticking the status
+# line. run_with_timeout cannot be used here because it starts the process
+# itself; the review is started a step earlier so it can overlap the CI wait.
+wait_with_status() {
+  local pid="$1" started="$2" rc=0 tick=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$VERBOSE" -eq 0 ]; then
+      draw_status "${SPIN_FRAMES[$((tick % ${#SPIN_FRAMES[@]}))]} $STEP_LABEL · $(format_duration "$(( $(date +%s) - started ))")"
+    fi
+    tick=$((tick + 1))
+    sleep 1
+  done
+  clear_status
+  set +e
+  wait "$pid"
+  rc=$?
+  set -e
+  return "$rc"
+}
+
+# Joins the running review and resolves its run dir. Sets REVIEW_RUN and
+# FINDINGS_JSON. Starts the review first if none is running (the CI-fix path
+# discards a review it had to invalidate).
+finish_review() {
+  local round="$1" rc=0 log new_runs
+  [ -n "$REVIEW_PID" ] || start_review "$round"
+  STEP_LABEL="Review round $round"
+  log="$LOG_DIR/review-$REVIEW_ROUND.log"
+  wait_with_status "$REVIEW_PID" "$REVIEW_STARTED" || rc=$?
+  REVIEW_PID=""
+  [ "$rc" -eq 0 ] || die "pr-codex-review failed (exit $rc), see $log"
+  [ "$VERBOSE" -eq 0 ] || cat "$log"
+
+  # The run dir this review created is the one added since the snapshot; a
+  # concurrent manual review would make this ambiguous, hence the fallback
+  # (the head_sha check in the loop catches a wrong pick).
+  new_runs="$(comm -13 <(printf '%s\n' "$RUNS_BEFORE") <(list_review_runs) | grep . || true)"
+  if [ "$(printf '%s\n' "$new_runs" | grep -c .)" -eq 1 ]; then
+    REVIEW_RUN="$new_runs"
+  else
+    echo "warning: could not identify exactly one new pr-codex-review run dir; falling back to the newest" >&2
+    # shellcheck disable=SC2012  # mtime ordering wanted; run dir names contain no newlines
+    REVIEW_RUN="$(ls -td "$HOME/.cache/pr-codex-review/$SAFE_REPO-pr-$PR_NUMBER-"* 2>/dev/null | head -1)"
+  fi
+  FINDINGS_JSON="$REVIEW_RUN/output/findings.json"
+  [ -f "$FINDINGS_JSON" ] || die "no findings.json in $REVIEW_RUN (pr-codex-review >= 1.2.0 required)"
+}
+
+# A CI fix changes the head sha, so a review of the current head is about to
+# become stale. Wait it out rather than killing it: pr-codex-review starts its
+# own Codex children, and a half-torn-down process tree is not worth the risk.
+# For abort paths that drop the EXIT trap (they send their own notification)
+# and therefore never reach cleanup.
+kill_review() {
+  [ -z "$REVIEW_PID" ] || kill_tree "$REVIEW_PID" 2>/dev/null || true
+  REVIEW_PID=""
+}
+
+discard_review() {
+  [ -n "$REVIEW_PID" ] || return 0
+  echo "${C_DIM}CI needs a fix; discarding the review of the outgoing head...${C_RESET}"
+  STEP_LABEL="Review round $REVIEW_ROUND (discarded)"
+  wait_with_status "$REVIEW_PID" "$REVIEW_STARTED" || true
+  REVIEW_PID=""
+  mv "$LOG_DIR/review-$REVIEW_ROUND.log" "$LOG_DIR/review-$REVIEW_ROUND-discarded.log" 2>/dev/null || true
+}
+
 # --- CI ---------------------------------------------------------------------------
 
 # Prints pass|none|fail. Retries while GitHub has not registered checks yet.
@@ -906,13 +1010,14 @@ ensure_ci_green() {
           return 1
         fi
         echo "${C_RED}CI red; starting fix attempt $attempt/$MAX_CI_FIXES.${C_RESET}"
+        discard_review
         fails="$(gh pr checks "$PR_NUMBER" --json name,bucket,workflow,link,description 2>/dev/null | jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")]')"
         pre_sha="$(git -C "$WORKTREE" rev-parse HEAD)"
         codex_call "ci-fix-$attempt" "CI on PR #$PR_NUMBER is red. Failing checks as JSON:
 
 $fails
 
-Inspect the failures with gh (for example: gh run view <run-id> --log-failed; the run id is the number after /runs/ in the link). Reproduce locally where practical, fix the problems, run the affected checks locally, commit, and push. Then babysit the PR until CI is green: watch the checks with gh pr checks $PR_NUMBER --watch, and if CI turns red again, fix, commit, and push until it is green."
+Inspect the failures with gh (for example: gh run view <run-id> --log-failed; the run id is the number after /runs/ in the link). Reproduce locally where practical, fix the problems, run the affected checks locally, commit, and push. Do not wait for CI; the pipeline watches the checks for you and starts another fix session if they are still red."
         question_gate "ci-fix-$attempt"
         ensure_committed "ci-fix-$attempt"
         CI_FIX_TOTAL=$((CI_FIX_TOTAL + 1))
@@ -926,7 +1031,11 @@ Inspect the failures with gh (for example: gh run view <run-id> --log-failed; th
 # --- Main loop ----------------------------------------------------------------------
 
 step "CI"
+# The first review only needs the pushed PR head, so it can already run while
+# the initial CI wait happens.
+start_review 1
 if ! ensure_ci_green; then
+  kill_review
   notify "CI rot" "PR #$PR_NUMBER nach $MAX_CI_FIXES Fix-Versuchen weiter rot"
   echo "CI still red after $MAX_CI_FIXES fix attempts: $PR_URL" >&2
   trap - EXIT
@@ -935,48 +1044,11 @@ fi
 
 CONVERGED=0
 ITERATION=0
-REVIEW_ARGS=()
-[ -z "$REVIEWERS" ] || REVIEW_ARGS+=(-n "$REVIEWERS")
-[ -z "$REVIEW_MODEL" ] || REVIEW_ARGS+=(--model "$REVIEW_MODEL")
-[ -z "$REVIEW_EFFORT" ] || REVIEW_ARGS+=(--effort "$REVIEW_EFFORT")
-
-list_review_runs() {
-  find "$HOME/.cache/pr-codex-review" -mindepth 1 -maxdepth 1 -type d \
-    -name "$SAFE_REPO-pr-$PR_NUMBER-*" 2>/dev/null | sort
-}
 
 while [ "$ITERATION" -lt "$MAX_ITER" ]; do
   ITERATION=$((ITERATION + 1))
   step "Review round $ITERATION/$MAX_ITER"
-  RUNS_BEFORE="$(list_review_runs)"
-  REVIEW_STARTED="$(date +%s)"
-  if [ "$VERBOSE" -eq 1 ]; then
-    pr-codex-review "$PR_NUMBER" ${REVIEW_ARGS[@]+"${REVIEW_ARGS[@]}"} \
-      || die "pr-codex-review failed; fix the review setup and rerun"
-  else
-    # Quiet mode: pr-codex-review prints its own banner and the full review
-    # comment, which duplicates what babysit already shows; keep that in the
-    # log and show only the status line plus a findings summary.
-    STEP_LABEL="Review round $ITERATION"
-    REVIEW_RC=0
-    run_with_timeout 0 "" "$LOG_DIR/review-$ITERATION.log" \
-      pr-codex-review "$PR_NUMBER" ${REVIEW_ARGS[@]+"${REVIEW_ARGS[@]}"} </dev/null || REVIEW_RC=$?
-    [ "$REVIEW_RC" -eq 0 ] || die "pr-codex-review failed (exit $REVIEW_RC), see $LOG_DIR/review-$ITERATION.log"
-  fi
-
-  # The run dir this review created is the one added since the snapshot; a
-  # concurrent manual review would make this ambiguous, hence the fallback
-  # (the head_sha check below catches a wrong pick).
-  NEW_RUNS="$(comm -13 <(printf '%s\n' "$RUNS_BEFORE") <(list_review_runs) | grep . || true)"
-  if [ "$(printf '%s\n' "$NEW_RUNS" | grep -c .)" -eq 1 ]; then
-    REVIEW_RUN="$NEW_RUNS"
-  else
-    echo "warning: could not identify exactly one new pr-codex-review run dir; falling back to the newest" >&2
-    # shellcheck disable=SC2012  # mtime ordering wanted; run dir names contain no newlines
-    REVIEW_RUN="$(ls -td "$HOME/.cache/pr-codex-review/$SAFE_REPO-pr-$PR_NUMBER-"* 2>/dev/null | head -1)"
-  fi
-  FINDINGS_JSON="$REVIEW_RUN/output/findings.json"
-  [ -f "$FINDINGS_JSON" ] || die "no findings.json in $REVIEW_RUN (pr-codex-review >= 1.2.0 required)"
+  finish_review "$ITERATION"
   REVIEWED_SHA="$(jq -r '.head_sha' "$FINDINGS_JSON")"
   CURRENT_SHA="$(git -C "$WORKTREE" rev-parse HEAD)"
   [ "$REVIEWED_SHA" = "$CURRENT_SHA" ] || die "findings.json is for $REVIEWED_SHA but the branch is at $CURRENT_SHA"
@@ -999,8 +1071,7 @@ Please check for each finding whether it is a real issue or might be intended be
 - For every real issue that is not intended: plan and fix it. This is mandatory for Blockers and Critical findings.
 - Suggestions: implement each one unless it describes intended behavior or you have a strong technical reason not to.
 - Resolve the Questions with your best judgment; only raise OPEN QUESTIONS if one truly needs a product decision.
-- Run the affected checks, commit your work, and push.
-- Then babysit the PR until CI is green: watch the checks with gh pr checks $PR_NUMBER --watch, and if CI turns red, fix, commit, and push until it is green.
+- Run the affected checks, commit your work, and push. Do not wait for CI; the pipeline watches the checks for you.
 
 Unless you end with the DISPUTED FINDINGS marker, end your final message with a line that is exactly:
 PR COMMENT:
@@ -1031,7 +1102,10 @@ $(cat "$REVIEW_RUN/output/final-pr-comment.md")"
   record_round "Review fix round $ITERATION" "$PRE_FIX_SHA"
   push_branch
   post_fix_comment "$ITERATION" "$PRE_FIX_SHA"
+  # Overlap the next review with this round's CI wait.
+  [ "$ITERATION" -ge "$MAX_ITER" ] || start_review "$((ITERATION + 1))"
   if ! ensure_ci_green; then
+    kill_review
     notify "CI rot" "PR #$PR_NUMBER nach Fix-Runde $ITERATION weiter rot"
     echo "CI still red after review fix round $ITERATION: $PR_URL" >&2
     trap - EXIT
