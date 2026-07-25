@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 SCRIPT_STARTED="$(date +%s)"
 
 usage() {
@@ -9,13 +9,17 @@ usage() {
 Usage:
   babysit [options] [pr-number|pr-url] [extra context...]
 
-Runs the review-fix-CI cycle for an existing GitHub PR until pr-codex-review
+Runs the review-fix cycle for an existing GitHub PR until pr-codex-review
 reports zero Blockers and Critical findings and CI is green:
 
-  1. Wait for CI; red checks go to a Codex fix session (up to --max-ci-fixes).
+  1. Wait for CI; red checks go to a Codex fix session that fixes, pushes,
+     and babysits the PR until CI is green (up to --max-ci-fixes attempts).
   2. Run pr-codex-review, which posts its review comment to the PR.
   3. Zero Blockers and Critical -> done, notification.
-     Otherwise -> Codex fix round, push, back to 1 (up to --max-iter rounds).
+     Otherwise -> Codex checks each finding (real issue or intended?),
+     fixes the real ones, commits, pushes, and babysits CI until green.
+     The pipeline then posts a PR comment logging what was fixed and goes
+     back to 2 (up to --max-iter rounds).
 
 Without a PR argument the PR of the current branch is used. Any extra
 positional text is handed to the Codex fix session as additional context.
@@ -38,10 +42,12 @@ Options:
                            Default: pr-codex-review default
   --review-model MODEL     Model for pr-codex-review. Default: codex default
   --review-effort LEVEL    Effort for pr-codex-review. Default: codex default
-  --max-iter N             Max review->fix rounds. Default: 3
+  --max-iter N             Max review->fix rounds. Default: 12
   --max-ci-fixes N         Max CI fix attempts per green-CI phase. Default: 3
   --fix-timeout DURATION   Kill a Codex fix step that runs longer than this.
-                           Seconds or 30m/1h; 0 disables. Default: 1h
+                           A fix step includes waiting for CI, so keep this
+                           above your CI runtime. Seconds or 30m/2h;
+                           0 disables. Default: 2h
   --no-notify              Disable macOS notifications
   --no-direnv              Skip direnv allow/exec
   --keep-worktree          Keep the temporary worktree after success
@@ -80,9 +86,9 @@ EFFORT=""
 REVIEWERS=""
 REVIEW_MODEL=""
 REVIEW_EFFORT=""
-MAX_ITER=3
+MAX_ITER=12
 MAX_CI_FIXES=3
-FIX_TIMEOUT="1h"
+FIX_TIMEOUT="2h"
 NOTIFY=1
 USE_DIRENV=1
 CLEANUP=1
@@ -492,7 +498,8 @@ Standing rules for every step:
 - Follow this repository's contributor and agent instructions (AGENTS.md, CLAUDE.md, CONTRIBUTING) where present.
 - Keep changes minimal and focused on the findings you are asked to address; match the existing code style and do not refactor beyond that.
 - Write clean, descriptive commit messages. Never mention AI, agents, Codex, or automation anywhere.
-- Never push, never create or edit PRs or comments, never rewrite published history. The pipeline handles git push.
+- You are on a detached checkout, so push with exactly: git push origin HEAD:refs/heads/$BRANCH
+- Only push when a step explicitly tells you to. Never create or edit PRs or comments, never rewrite published history.
 - Make reasonable technical decisions yourself.
 - Only for product decisions you cannot responsibly make yourself (data semantics, user-visible policy, migration of existing data): stop and end your final message with a line that is exactly:
 OPEN QUESTIONS:
@@ -633,9 +640,11 @@ ensure_committed() {
   [ -z "$(git -C "$WORKTREE" status --porcelain)" ] || die "worktree still has uncommitted changes; inspect $WORKTREE"
 }
 
-# After a push, gh pr checks can briefly still report the previous head's
-# completed checks, so a red new commit could read green. Wait until GitHub
-# reports the pushed sha as the PR head.
+# Codex pushes during its step; this is the safety net for a forgotten push
+# (pushing an already-pushed head is a no-op). After a push, gh pr checks can
+# briefly still report the previous head's completed checks, so a red new
+# commit could read green. Wait until GitHub reports the pushed sha as the
+# PR head.
 push_branch() {
   local pushed_sha remote_sha waited=0
   pushed_sha="$(git -C "$WORKTREE" rev-parse HEAD)"
@@ -662,6 +671,29 @@ $commits
 
 "
   printf '%s:\n%s\n\n' "$label" "$commits" >> "$LOG_DIR/rounds.log"
+}
+
+# Post the per-round fix log to the PR. The comment text comes from the
+# PR COMMENT: section of the round's final Codex message; if a later gate
+# step produced the newest message, the round's base message still has it.
+# Fallback: the round's commit list.
+post_fix_comment() {
+  local round="$1" pre_sha="$2" body="" commits f
+  for f in "$LAST_MSG" "$MSG_DIR/fix-round-$round.md"; do
+    [ -f "$f" ] || continue
+    if grep -q '^PR COMMENT:' "$f"; then
+      body="$(sed -n '/^PR COMMENT:/,$p' "$f" | sed '1d')"
+      break
+    fi
+  done
+  if [ -z "$body" ]; then
+    commits="$(git -C "$WORKTREE" log --oneline "$pre_sha..HEAD" 2>/dev/null || true)"
+    [ -n "$commits" ] || return 0
+    # shellcheck disable=SC2016  # the backticks are literal markdown fences
+    body="$(printf 'Review round %s:\n\n```\n%s\n```' "$round" "$commits")"
+  fi
+  gh pr comment "$PR_NUMBER" --body "$body" >/dev/null \
+    || echo "warning: could not post the fix-log comment to PR #$PR_NUMBER" >&2
 }
 
 # --- CI ---------------------------------------------------------------------------
@@ -723,7 +755,7 @@ ensure_ci_green() {
 
 $fails
 
-Inspect the failures with gh (for example: gh run view <run-id> --log-failed; the run id is the number after /runs/ in the link). Reproduce locally where practical, fix the problems, run the affected checks locally, and commit. Do not push."
+Inspect the failures with gh (for example: gh run view <run-id> --log-failed; the run id is the number after /runs/ in the link). Reproduce locally where practical, fix the problems, run the affected checks locally, commit, and push. Then babysit the PR until CI is green: watch the checks with gh pr checks $PR_NUMBER --watch, and if CI turns red again, fix, commit, and push until it is green."
         question_gate "ci-fix-$attempt"
         ensure_committed "ci-fix-$attempt"
         CI_FIX_TOTAL=$((CI_FIX_TOTAL + 1))
@@ -791,10 +823,16 @@ while [ "$ITERATION" -lt "$MAX_ITER" ]; do
   PRE_FIX_SHA="$CURRENT_SHA"
   codex_call "fix-round-$ITERATION" "An external code review of PR #$PR_NUMBER found issues. The full review comment follows below.
 
-- Fix ALL items listed under Blockers and Critical.
-- Address the Suggestions: implement each one unless you have a strong technical reason not to.
+Please check for each finding whether it is a real issue or might be intended behavior.
+- For every real issue that is not intended: plan and fix it. This is mandatory for Blockers and Critical findings.
+- Suggestions: implement each one unless it describes intended behavior or you have a strong technical reason not to.
 - Resolve the Questions with your best judgment; only raise OPEN QUESTIONS if one truly needs a product decision.
-- Run the affected checks and commit your work. Do not push.
+- Run the affected checks, commit your work, and push.
+- Then babysit the PR until CI is green: watch the checks with gh pr checks $PR_NUMBER --watch, and if CI turns red, fix, commit, and push until it is green.
+
+Unless you end with the DISPUTED FINDINGS marker, end your final message with a line that is exactly:
+PR COMMENT:
+followed by a short log comment for the PR: what you fixed and how, and which findings you left unchanged because they are intended. Write it in the language of the PR description, plain and factual, and never mention AI, agents, or automation in it. Use this marker for nothing else.
 
 ---
 
@@ -820,6 +858,7 @@ $(cat "$REVIEW_RUN/output/final-pr-comment.md")"
 
   record_round "Review fix round $ITERATION" "$PRE_FIX_SHA"
   push_branch
+  post_fix_comment "$ITERATION" "$PRE_FIX_SHA"
   if ! ensure_ci_green; then
     notify "CI rot" "PR #$PR_NUMBER nach Fix-Runde $ITERATION weiter rot"
     echo "CI still red after review fix round $ITERATION: $PR_URL" >&2

@@ -1,8 +1,8 @@
 # babysit
 
-You implement, the pipeline iterates: review, fix, CI, repeat, until the PR is clean. Then you get a notification and do the manual test.
+You implement, `babysit` iterates: review, fix, CI, repeat, until the PR is clean. Then you get a notification and do the manual test.
 
-`babysit` automates the loop after the first implementation of a PR exists. It waits for CI and lets a Codex session fix red checks, runs [`pr-codex-review`](https://github.com/yungweng/pr-codex-review), and feeds the review findings back into the same Codex session for a fix round. The loop ends when a review reports zero Blockers and Critical findings and CI is green. Deliberately out of scope: picking issues, planning, and the first implementation. That part stays with you.
+`babysit` automates the loop after the first implementation of a PR exists. It runs [`pr-codex-review`](https://github.com/yungweng/pr-codex-review) and feeds the review findings into a resumable Codex session, which checks each finding (real issue or intended?), fixes the real ones, commits, pushes, and babysits CI until it is green. After each fix round the pipeline posts a comment to the PR logging what was fixed. The loop ends when a review reports zero Blockers and Critical findings and CI is green. Deliberately out of scope: picking issues, planning, and the first implementation. That part stays with you.
 
 ## Requirements
 
@@ -15,7 +15,7 @@ pr-codex-review  (>= 1.2.0, needed for findings.json)
 direnv           (optional, skip with --no-direnv)
 ```
 
-The Codex fix sessions inherit your `~/.codex/config.toml`. They must be allowed to run commands (tests, linters) and, for CI fix rounds, to call `gh`. A restrictive sandbox without network will make CI fix rounds fail.
+The Codex fix sessions inherit your `~/.codex/config.toml`. They must be allowed to run commands (tests, linters), to `git push`, and to call `gh` for watching CI. A restrictive sandbox without network will make fix rounds fail.
 
 ## Install
 
@@ -41,13 +41,17 @@ babysit 1811 --effort high "Focus on the time-tracking module"
 
 ## What It Does
 
-1. **CI.** `gh pr checks --watch` waits for CI. Red checks go to a Codex fix session together with the failing-check details; it fixes, commits, the pipeline pushes and waits again (up to `--max-ci-fixes` attempts).
+1. **CI.** `gh pr checks --watch` waits for CI. Red checks go to a Codex fix session together with the failing-check details; it fixes, commits, pushes, and babysits CI until green (up to `--max-ci-fixes` attempts, each verified by the pipeline).
 2. **Review.** `pr-codex-review` reviews the PR and posts its comment, then writes `findings.json`.
-3. **Decision.** Zero Blockers and Critical: done, notification, ready for manual testing. Otherwise the full review comment goes back into the Codex session, which fixes, commits; the pipeline pushes and returns to step 1. After `--max-iter` rounds without convergence it stops and tells you.
+3. **Decision.** Zero Blockers and Critical: done, notification, ready for manual testing. Otherwise the full review comment goes back into the Codex session, which checks each finding for whether it is a real issue or intended behavior, fixes the real ones, commits, pushes, and babysits CI until green. The pipeline verifies the push and CI state, posts a fix-log comment to the PR, and returns to step 2. After `--max-iter` rounds without convergence it stops and tells you.
 
 Only Blockers and Critical keep the loop alive. Suggestions and Questions are handed to each fix round once (implement or consciously reject), so the loop cannot chase moving targets forever.
 
 All fix rounds share one Codex session, so context carries from CI fixes through every review round. The session id is recovered from `~/.codex/sessions/` by matching the run's unique worktree path, so concurrent Codex sessions elsewhere do not interfere.
+
+## Fix-Log Comments
+
+Every fix round ends with a comment on the PR describing what was fixed and how, and which findings were left unchanged because they are intended. The Codex session writes the text (in the language of the PR description); the pipeline posts it via `gh pr comment`, so it appears under your account. If the session fails to produce the text, the pipeline posts the round's commit list instead.
 
 ## Open Questions Gate
 
@@ -70,14 +74,15 @@ Effort is one of: minimal, low, medium, high, xhigh.
 Passed through to pr-codex-review for every review round.
 
 --max-iter N
-Maximum review->fix rounds. Default: 3.
+Maximum review->fix rounds. Default: 12.
 
 --max-ci-fixes N
 Maximum CI fix attempts per green-CI phase. Default: 3.
 
 --fix-timeout DURATION
-Kill a Codex fix step that runs longer than this.
-Seconds or values like 30m, 1h; 0 disables. Default: 1h.
+Kill a Codex fix step that runs longer than this. A fix step
+includes waiting for CI, so keep this above your CI runtime.
+Seconds or values like 30m, 2h; 0 disables. Default: 2h.
 
 --no-notify
 Disable macOS notifications (the terminal bell stays).
@@ -106,12 +111,12 @@ Failed runs always keep it for inspection.
 
 ## Safety Stops
 
-- **Do not push to the PR branch manually while a run is active.** `pr-codex-review` refuses to post when the PR head moves during its review, and the pipeline treats that as a hard failure. After each of its own pushes the pipeline waits until GitHub reports the new head before reading checks, so a stale check result cannot pass as green.
+- **Do not push to the PR branch manually while a run is active.** `pr-codex-review` refuses to post when the PR head moves during its review, and the pipeline treats that as a hard failure. The Codex session pushes during fix rounds; the pipeline re-pushes as a safety net and waits until GitHub reports the new head before reading checks, so a stale check result cannot pass as green.
 - The pipeline refuses to start when your checkout of the PR branch has uncommitted changes, or when the local branch differs from `origin`: it reviews the pushed head and would otherwise silently ignore your local work.
 - Cross-repository (fork) PRs are refused at start: the pipeline fetches and pushes `refs/heads/<branch>` on `origin`, which for a fork PR would hit the wrong branch.
 - If a Codex step changes any `.envrc`, the pipeline stops and asks before running `direnv allow` on the changed file.
 - If a fix round ends with findings still open but no new commits, the pipeline stops (exit 5) instead of looping on a stuck state; the only exception is an explicit `DISPUTED FINDINGS:` block, which hands the decision to you (see Dispute Gate).
-- Codex fix steps are killed after `--fix-timeout` (default 1h), so a hung session cannot stall the run silently.
+- Codex fix steps are killed after `--fix-timeout` (default 2h), so a hung session cannot stall the run silently.
 - Gates abort with exit 2 when stdin is not a terminal instead of hanging or spinning.
 
 ## Run Directory
