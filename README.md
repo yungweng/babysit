@@ -53,9 +53,13 @@ All fix rounds share one Codex session, so context carries from CI fixes through
 
 Every fix round ends with a comment on the PR describing what was fixed and how, and which findings were left unchanged because they are intended. The Codex session writes the text (in the language of the PR description); the pipeline posts it via `gh pr comment`, so it appears under your account. If the session fails to produce the text, the pipeline posts the round's commit list instead.
 
+## Quiet Output
+
+Fix and review steps show a spinner status line with the step name and elapsed time, followed by a one-line completion mark (review rounds add the finding counts); the full Codex and pr-codex-review output always goes to the run directory's logs. Pass `--verbose` to stream everything to the terminal instead.
+
 ## Open Questions Gate
 
-The fix session makes routine technical decisions itself. For product decisions it cannot responsibly make (data semantics, user-visible policy, migration of existing data), it ends its message with an `OPEN QUESTIONS:` block. The pipeline notifies you, prints the questions, and blocks until you type answers in the terminal; the answers go back into the session and the run continues. Since everything streams to your terminal, you can also just watch or intervene at the next gate.
+The fix session makes routine technical decisions itself. For product decisions it cannot responsibly make (data semantics, user-visible policy, migration of existing data), it ends its message with an `OPEN QUESTIONS:` block. The pipeline notifies you, prints the questions, and blocks until you type answers in the terminal; the answers go back into the session and the run continues.
 
 Gates need an interactive terminal. If a gate is hit while stdin is not a terminal (redirected input, background run), the pipeline aborts with exit 2 instead of hanging.
 
@@ -87,6 +91,10 @@ Seconds or values like 30m, 2h; 0 disables. Default: 2h.
 --sandboxed
 Run the Codex fix sessions with your codex sandbox/approval
 defaults instead of --dangerously-bypass-approvals-and-sandbox.
+
+--verbose
+Stream the full Codex and review output to the terminal
+instead of the quiet status line.
 
 --no-notify
 Disable macOS notifications (the terminal bell stays).

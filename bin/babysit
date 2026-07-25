@@ -55,6 +55,8 @@ Options:
   --sandboxed              Run Codex fix sessions with your codex
                            sandbox/approval defaults instead of
                            --dangerously-bypass-approvals-and-sandbox
+  --verbose                Stream the full Codex and review output to the
+                           terminal instead of the quiet status line
   --no-notify              Disable macOS notifications
   --no-direnv              Skip direnv allow/exec
   --keep-worktree          Keep the temporary worktree after success
@@ -97,6 +99,7 @@ MAX_ITER=12
 MAX_CI_FIXES=3
 FIX_TIMEOUT="2h"
 BYPASS=1
+VERBOSE=0
 NOTIFY=1
 USE_DIRENV=1
 CLEANUP=1
@@ -120,6 +123,7 @@ while [ "$#" -gt 0 ]; do
     --fix-timeout)    FIX_TIMEOUT="${2:-}"; shift 2 ;;
     --fix-timeout=*)  FIX_TIMEOUT="${1#*=}"; shift ;;
     --sandboxed)      BYPASS=0; shift ;;
+    --verbose)        VERBOSE=1; shift ;;
     --no-notify)      NOTIFY=0; shift ;;
     --no-direnv)      USE_DIRENV=0; shift ;;
     --keep-worktree)  CLEANUP=0; shift ;;
@@ -191,7 +195,9 @@ C_RED=""
 C_DIM=""
 C_BOLD=""
 C_RESET=""
+UI_TTY=0
 if [ -t 1 ] && [ -n "${TERM:-}" ] && command -v tput >/dev/null 2>&1; then
+  UI_TTY=1
   C_GREEN="$(tput setaf 2 2>/dev/null || true)"
   C_RED="$(tput setaf 1 2>/dev/null || true)"
   C_DIM="$(tput dim 2>/dev/null || true)"
@@ -199,8 +205,30 @@ if [ -t 1 ] && [ -n "${TERM:-}" ] && command -v tput >/dev/null 2>&1; then
   C_RESET="$(tput sgr0 2>/dev/null || true)"
 fi
 
-HR_LINE="────────────────────────────────────────────────────────────"
-[ -t 1 ] || HR_LINE="------------------------------------------------------------"
+SPIN_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+SYM_OK="ok:"
+HR_LINE="------------------------------------------------------------"
+if [ "$UI_TTY" -eq 1 ]; then
+  SYM_OK="✓"
+  HR_LINE="────────────────────────────────────────────────────────────"
+fi
+
+# One transient status line at the bottom of the output, redrawn in place.
+# Only used on a TTY; everything permanent goes through plain echo.
+STATUS_SHOWN=0
+draw_status() {
+  if [ "$UI_TTY" -eq 1 ]; then
+    printf '\r\033[K%s' "${C_DIM}$1${C_RESET}"
+    STATUS_SHOWN=1
+  fi
+}
+
+clear_status() {
+  if [ "$STATUS_SHOWN" -eq 1 ]; then
+    printf '\r\033[K'
+    STATUS_SHOWN=0
+  fi
+}
 
 hr() {
   echo "${C_DIM}${HR_LINE}${C_RESET}"
@@ -439,20 +467,29 @@ force_kill_tree() {
   kill -KILL "$pid" 2>/dev/null || true
 }
 
+# In quiet mode (default) the poll loop also ticks the transient status
+# line, so the label set in STEP_LABEL is what the user sees while a Codex
+# step runs. Verbose mode streams Codex output instead, so no status line.
+STEP_LABEL=""
+
 run_with_timeout() {
   local seconds="$1"
   local label="$2"
-  shift 2
-  if [ "$seconds" -eq 0 ]; then
-    "$@"
-    return
-  fi
+  local log_file="$3"
+  shift 3
 
-  "$@" &
+  if [ -n "$log_file" ]; then
+    "$@" >"$log_file" 2>&1 &
+  else
+    "$@" &
+  fi
   local child="$!"
-  local elapsed=0
+  local started elapsed tick=0
+  started="$(date +%s)"
   while kill -0 "$child" 2>/dev/null; do
-    if [ "$elapsed" -ge "$seconds" ]; then
+    elapsed="$(( $(date +%s) - started ))"
+    if [ "$seconds" -gt 0 ] && [ "$elapsed" -ge "$seconds" ]; then
+      clear_status
       echo "error: codex step timed out after $label; terminating process tree rooted at $child" >&2
       kill_tree "$child"
       sleep 2
@@ -462,9 +499,13 @@ run_with_timeout() {
       wait "$child" 2>/dev/null || true
       return 124
     fi
-    sleep 5
-    elapsed=$((elapsed + 5))
+    if [ "$VERBOSE" -eq 0 ]; then
+      draw_status "${SPIN_FRAMES[$((tick % ${#SPIN_FRAMES[@]}))]} $STEP_LABEL · $(format_duration "$elapsed")"
+    fi
+    tick=$((tick + 1))
+    sleep 1
   done
+  clear_status
   wait "$child"
 }
 
@@ -491,17 +532,44 @@ capture_session_id() {
   return 1
 }
 
+# Runs a codex exec step: quiet by default (full output goes to the log,
+# the terminal gets the status line and a completion line), streamed with
+# --verbose. Returns codex's exit code, or 124 on timeout.
+run_codex_step() {
+  local tag="$1"
+  shift
+  local rc started
+  case "$tag" in
+    fix-round-*) STEP_LABEL="Fix round ${tag#fix-round-}" ;;
+    ci-fix-*)    STEP_LABEL="CI fix ${tag#ci-fix-}" ;;
+    *)           STEP_LABEL="Codex $tag" ;;
+  esac
+  started="$(date +%s)"
+  set +e
+  if [ "$VERBOSE" -eq 1 ]; then
+    run_with_timeout "$FIX_TIMEOUT_SECONDS" "$FIX_TIMEOUT" "" "$@" </dev/null 2>&1 | tee "$LOG_DIR/$tag.log"
+    rc="${PIPESTATUS[0]}"
+  else
+    if [ "$UI_TTY" -eq 0 ]; then
+      echo "running: $STEP_LABEL"
+    fi
+    run_with_timeout "$FIX_TIMEOUT_SECONDS" "$FIX_TIMEOUT" "$LOG_DIR/$tag.log" "$@" </dev/null
+    rc=$?
+  fi
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    echo "${C_DIM}$SYM_OK $STEP_LABEL · $(format_duration "$(( $(date +%s) - started ))")${C_RESET}"
+  fi
+  return "$rc"
+}
+
 codex_new() {
-  local tag="$1" prompt="$2" rc
+  local tag="$1" prompt="$2" rc=0
   LAST_MSG="$MSG_DIR/$tag.md"
   check_envrc
-  set +e
-  # PIPESTATUS[0] is run_with_timeout's return: codex's exit code, or 124 on timeout.
-  run_with_timeout "$FIX_TIMEOUT_SECONDS" "$FIX_TIMEOUT" \
+  run_codex_step "$tag" \
     run_in_worktree codex exec ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} \
-    -o "$LAST_MSG" "$prompt" </dev/null 2>&1 | tee "$LOG_DIR/$tag.log"
-  rc="${PIPESTATUS[0]}"
-  set -e
+    -o "$LAST_MSG" "$prompt" || rc=$?
   [ "$rc" -ne 124 ] || die "codex fix step timed out after $FIX_TIMEOUT (--fix-timeout; 0 disables), see $LOG_DIR/$tag.log"
   [ "$rc" -eq 0 ] || die "codex exec failed with exit $rc, see $LOG_DIR/$tag.log"
   [ -s "$LAST_MSG" ] || die "codex produced no final message, see $LOG_DIR/$tag.log"
@@ -509,16 +577,13 @@ codex_new() {
 }
 
 codex_resume() {
-  local tag="$1" prompt="$2" rc
+  local tag="$1" prompt="$2" rc=0
   [ -n "$SESSION_ID" ] || die "no Codex session to resume"
   LAST_MSG="$MSG_DIR/$tag.md"
   check_envrc
-  set +e
-  run_with_timeout "$FIX_TIMEOUT_SECONDS" "$FIX_TIMEOUT" \
+  run_codex_step "$tag" \
     run_in_worktree codex exec resume "$SESSION_ID" ${CODEX_FLAGS[@]+"${CODEX_FLAGS[@]}"} \
-    -o "$LAST_MSG" "$prompt" </dev/null 2>&1 | tee "$LOG_DIR/$tag.log"
-  rc="${PIPESTATUS[0]}"
-  set -e
+    -o "$LAST_MSG" "$prompt" || rc=$?
   [ "$rc" -ne 124 ] || die "codex fix step timed out after $FIX_TIMEOUT (--fix-timeout; 0 disables), see $LOG_DIR/$tag.log"
   [ "$rc" -eq 0 ] || die "codex exec resume failed with exit $rc, see $LOG_DIR/$tag.log"
   [ -s "$LAST_MSG" ] || die "codex produced no final message, see $LOG_DIR/$tag.log"
@@ -824,8 +889,20 @@ while [ "$ITERATION" -lt "$MAX_ITER" ]; do
   ITERATION=$((ITERATION + 1))
   step "Review round $ITERATION/$MAX_ITER"
   RUNS_BEFORE="$(list_review_runs)"
-  pr-codex-review "$PR_NUMBER" ${REVIEW_ARGS[@]+"${REVIEW_ARGS[@]}"} \
-    || die "pr-codex-review failed; fix the review setup and rerun"
+  REVIEW_STARTED="$(date +%s)"
+  if [ "$VERBOSE" -eq 1 ]; then
+    pr-codex-review "$PR_NUMBER" ${REVIEW_ARGS[@]+"${REVIEW_ARGS[@]}"} \
+      || die "pr-codex-review failed; fix the review setup and rerun"
+  else
+    # Quiet mode: pr-codex-review prints its own banner and the full review
+    # comment, which duplicates what babysit already shows; keep that in the
+    # log and show only the status line plus a findings summary.
+    STEP_LABEL="Review round $ITERATION"
+    REVIEW_RC=0
+    run_with_timeout 0 "" "$LOG_DIR/review-$ITERATION.log" \
+      pr-codex-review "$PR_NUMBER" ${REVIEW_ARGS[@]+"${REVIEW_ARGS[@]}"} </dev/null || REVIEW_RC=$?
+    [ "$REVIEW_RC" -eq 0 ] || die "pr-codex-review failed (exit $REVIEW_RC), see $LOG_DIR/review-$ITERATION.log"
+  fi
 
   # The run dir this review created is the one added since the snapshot; a
   # concurrent manual review would make this ambiguous, hence the fallback
@@ -846,12 +923,15 @@ while [ "$ITERATION" -lt "$MAX_ITER" ]; do
 
   BLOCKERS="$(jq -r '.blockers' "$FINDINGS_JSON")"
   CRITICAL="$(jq -r '.critical' "$FINDINGS_JSON")"
+  FINDINGS_LINE="$BLOCKERS blockers, $CRITICAL critical, $(jq -r '.suggestions' "$FINDINGS_JSON") suggestions, $(jq -r '.questions' "$FINDINGS_JSON") questions"
   if [ "$((BLOCKERS + CRITICAL))" -eq 0 ]; then
+    echo "${C_DIM}$SYM_OK Review round $ITERATION · $(format_duration "$(( $(date +%s) - REVIEW_STARTED ))") ·${C_RESET} ${C_GREEN}$FINDINGS_LINE${C_RESET}"
     CONVERGED=1
     break
   fi
+  echo "${C_DIM}$SYM_OK Review round $ITERATION · $(format_duration "$(( $(date +%s) - REVIEW_STARTED ))") ·${C_RESET} ${C_RED}$FINDINGS_LINE${C_RESET}"
 
-  echo "${C_RED}$BLOCKERS blockers, $CRITICAL critical -> fix round${C_RESET}"
+  step "Fix round $ITERATION/$MAX_ITER"
   PRE_FIX_SHA="$CURRENT_SHA"
   codex_call "fix-round-$ITERATION" "An external code review of PR #$PR_NUMBER found issues. The full review comment follows below.
 
