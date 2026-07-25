@@ -57,15 +57,17 @@ Every fix round ends with a comment on the PR describing what was fixed and how,
 
 Fix and review steps show a spinner status line with the step name and elapsed time, followed by a one-line completion mark (review rounds add the finding counts); the full Codex and pr-codex-review output always goes to the run directory's logs. Pass `--verbose` to stream everything to the terminal instead.
 
-## Open Questions Gate
+## Gates: Autonomous by Default
 
-The fix session makes routine technical decisions itself. For product decisions it cannot responsibly make (data semantics, user-visible policy, migration of existing data), it ends its message with an `OPEN QUESTIONS:` block. The pipeline notifies you, prints the questions, and blocks until you type answers in the terminal; the answers go back into the session and the run continues.
+The run is fully autonomous by default: start it and walk away. The three situations that used to need a human are decided automatically:
 
-Gates need an interactive terminal. If a gate is hit while stdin is not a terminal (redirected input, background run), the pipeline aborts with exit 2 instead of hanging.
+- **Product decisions.** Codex is instructed to decide everything itself, picking the most conservative reasonable option and recording notable decisions in the fix-log comment. If it still ends a step with an `OPEN QUESTIONS:` block, the questions are bounced back for it to decide itself; after three bounces the run gives up (exit 2) rather than looping.
+- **Disputed findings.** Review findings can be wrong. If a fix round ends with no commits but a `DISPUTED FINDINGS:` block, the dispute is never accepted as-is: Codex must first survive one forced adversarial re-check (actively trying to reproduce each finding). If it fixes something after all, the loop continues normally; if it upholds the dispute, the rebuttals are accepted, shown in the final summary, and the run finishes successfully. The review comment on the PR still lists those findings, so check the summary before merging.
+- **Changed `.envrc` files.** The diff is printed, a notification fires, and `direnv allow` runs automatically. With the sandbox bypassed Codex can execute anything anyway, so this gate adds no protection in the default mode.
 
-## Dispute Gate
+With `--interactive`, the pipeline instead notifies you and blocks in the terminal at each gate: type answers to open questions, and at a dispute type `a` to accept, a reply to send back into the session, or `q` to abort. Interactive gates need a terminal on stdin; without one the run aborts with exit 2 instead of hanging.
 
-Review findings can be wrong. If a fix round ends with no commits but the session ends its message with a `DISPUTED FINDINGS:` block, Codex is claiming the remaining Blocker/Critical findings are false positives and no code change is warranted. The pipeline notifies you, prints the rebuttals, and asks: type `a` to accept them and finish the run successfully (you signed off on the remaining findings; note the review comment on the PR still lists them), type a reply to send it back into the session (Codex then fixes, or disputes again), or `q` to abort. Without a dispute, a fix round with no commits still stops the run (exit 5).
+Either way, a fix round that ends with findings still open, no commits, and no live dispute stops the run (exit 5).
 
 ## Options
 
@@ -92,6 +94,10 @@ Seconds or values like 30m, 2h; 0 disables. Default: 2h.
 Run the Codex fix sessions with your codex sandbox/approval
 defaults instead of --dangerously-bypass-approvals-and-sandbox.
 
+--interactive
+Stop at gates (open questions, disputes, .envrc changes) and
+ask in the terminal instead of deciding autonomously.
+
 --verbose
 Stream the full Codex and review output to the terminal
 instead of the quiet status line.
@@ -113,9 +119,11 @@ Failed runs always keep it for inspection.
 
 ```text
 0  success: CI green and review clean, or remaining findings
-   disputed by Codex and accepted by you
-2  aborted at a gate (open questions, .envrc change, dispute,
-   or a gate was hit without an interactive terminal)
+   disputed by Codex and accepted (by you, or automatically
+   after the forced re-check in autonomous mode)
+2  aborted at a gate: user abort or missing terminal with
+   --interactive, or Codex keeps asking questions although
+   autonomous mode told it to decide itself
 3  CI still red after --max-ci-fixes attempts
 4  review not converged after --max-iter rounds
 5  a fix round produced no changes although findings remain
@@ -126,10 +134,10 @@ Failed runs always keep it for inspection.
 - **Do not push to the PR branch manually while a run is active.** `pr-codex-review` refuses to post when the PR head moves during its review, and the pipeline treats that as a hard failure. The Codex session pushes during fix rounds; the pipeline re-pushes as a safety net and waits until GitHub reports the new head before reading checks, so a stale check result cannot pass as green.
 - The pipeline refuses to start when your checkout of the PR branch has uncommitted changes, or when the local branch differs from `origin`: it reviews the pushed head and would otherwise silently ignore your local work.
 - Cross-repository (fork) PRs are refused at start: the pipeline fetches and pushes `refs/heads/<branch>` on `origin`, which for a fork PR would hit the wrong branch.
-- If a Codex step changes a `.envrc` that existed when the run started, or creates a new non-ignored `.envrc`, the pipeline stops and asks before running `direnv allow`. Generated `.envrc` files that appear later inside Git-ignored caches such as `.devbox/` do not trigger the gate.
-- If a fix round ends with findings still open but no new commits, the pipeline stops (exit 5) instead of looping on a stuck state; the only exception is an explicit `DISPUTED FINDINGS:` block, which hands the decision to you (see Dispute Gate).
+- If a Codex step changes a `.envrc` that existed when the run started, or creates a new non-ignored `.envrc`, the diff is shown before `direnv allow` runs (automatically by default, after your approval with `--interactive`). Generated `.envrc` files that appear later inside Git-ignored caches such as `.devbox/` do not trigger this.
+- If a fix round ends with findings still open but no new commits, the pipeline stops (exit 5) instead of looping on a stuck state; the only exception is an explicit `DISPUTED FINDINGS:` block, which goes through the dispute handling (see Gates).
 - Codex fix steps are killed after `--fix-timeout` (default 2h), so a hung session cannot stall the run silently.
-- Gates abort with exit 2 when stdin is not a terminal instead of hanging or spinning.
+- Interactive gates abort with exit 2 when stdin is not a terminal instead of hanging or spinning.
 
 ## Run Directory
 
