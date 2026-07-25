@@ -15,7 +15,7 @@ pr-codex-review  (>= 1.2.0, needed for findings.json)
 direnv           (optional, skip with --no-direnv)
 ```
 
-The Codex fix sessions inherit your `~/.codex/config.toml`. They must be allowed to run commands (tests, linters), to `git push`, and to call `gh` for watching CI. A restrictive sandbox without network will make fix rounds fail.
+The Codex fix sessions run with `--dangerously-bypass-approvals-and-sandbox` by default: they must run tests, `git push`, and watch CI via `gh`, all unattended, and a sandboxed or approval-gated `codex exec` would silently skip those commands. Be aware what that means: an unattended agent with full file and network access on your machine, for up to `--fix-timeout` per step. Pass `--sandboxed` to use your `~/.codex/config.toml` defaults instead; then your config must allow commands, network, and push, or fix rounds will fail. The review side is unaffected: `pr-codex-review` manages its own (read-only) sandbox.
 
 ## Install
 
@@ -83,6 +83,10 @@ Maximum CI fix attempts per green-CI phase. Default: 3.
 Kill a Codex fix step that runs longer than this. A fix step
 includes waiting for CI, so keep this above your CI runtime.
 Seconds or values like 30m, 2h; 0 disables. Default: 2h.
+
+--sandboxed
+Run the Codex fix sessions with your codex sandbox/approval
+defaults instead of --dangerously-bypass-approvals-and-sandbox.
 
 --no-notify
 Disable macOS notifications (the terminal bell stays).

@@ -24,6 +24,10 @@ reports zero Blockers and Critical findings and CI is green:
 Without a PR argument the PR of the current branch is used. Any extra
 positional text is handed to the Codex fix session as additional context.
 
+The Codex fix sessions run with --dangerously-bypass-approvals-and-sandbox
+by default: they must run tests, push, and watch CI via gh, all unattended.
+Pass --sandboxed to use your codex sandbox/approval defaults instead.
+
 The PR's implementation must be committed and pushed before starting: the
 pipeline works on the pushed PR head in its own worktree and never touches
 your checkout. If Codex hits a product decision it cannot make, you get a
@@ -48,6 +52,9 @@ Options:
                            A fix step includes waiting for CI, so keep this
                            above your CI runtime. Seconds or 30m/2h;
                            0 disables. Default: 2h
+  --sandboxed              Run Codex fix sessions with your codex
+                           sandbox/approval defaults instead of
+                           --dangerously-bypass-approvals-and-sandbox
   --no-notify              Disable macOS notifications
   --no-direnv              Skip direnv allow/exec
   --keep-worktree          Keep the temporary worktree after success
@@ -89,6 +96,7 @@ REVIEW_EFFORT=""
 MAX_ITER=12
 MAX_CI_FIXES=3
 FIX_TIMEOUT="2h"
+BYPASS=1
 NOTIFY=1
 USE_DIRENV=1
 CLEANUP=1
@@ -111,6 +119,7 @@ while [ "$#" -gt 0 ]; do
     --max-ci-fixes=*) MAX_CI_FIXES="${1#*=}"; shift ;;
     --fix-timeout)    FIX_TIMEOUT="${2:-}"; shift 2 ;;
     --fix-timeout=*)  FIX_TIMEOUT="${1#*=}"; shift ;;
+    --sandboxed)      BYPASS=0; shift ;;
     --no-notify)      NOTIFY=0; shift ;;
     --no-direnv)      USE_DIRENV=0; shift ;;
     --keep-worktree)  CLEANUP=0; shift ;;
@@ -164,6 +173,9 @@ FIX_TIMEOUT_SECONDS="$(duration_to_seconds "$FIX_TIMEOUT")"
 CODEX_FLAGS=()
 [ -z "$MODEL" ] || CODEX_FLAGS+=(-m "$MODEL")
 [ -z "$EFFORT" ] || CODEX_FLAGS+=(-c "model_reasoning_effort=$EFFORT")
+# Fix sessions push and watch CI via gh, unattended; a sandboxed or
+# approval-gated codex exec would silently skip those commands.
+[ "$BYPASS" -eq 0 ] || CODEX_FLAGS+=(--dangerously-bypass-approvals-and-sandbox)
 
 need gh
 need git
@@ -295,6 +307,11 @@ row "PR" "${C_BOLD}#$PR_NUMBER $PR_TITLE${C_RESET}"
 row "Repo" "$CURRENT_REPO"
 row "Branch" "$BRANCH -> $BASE_BRANCH"
 row "Model" "$MODEL_DESC"
+if [ "$BYPASS" -eq 1 ]; then
+  row "Sandbox" "bypassed (--dangerously-bypass-approvals-and-sandbox)"
+else
+  row "Sandbox" "codex defaults (--sandboxed)"
+fi
 row "Loops" "max $MAX_ITER review rounds, $MAX_CI_FIXES CI fixes"
 row "Timeout" "$FIX_TIMEOUT per codex fix step"
 row "Run dir" "$RUN_ROOT"

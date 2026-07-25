@@ -24,6 +24,7 @@ README.md                 user-facing docs, keep in sync with --help
 - The dispute gate never weakens the no-commit stop: exit 5 still fires whenever a fix round ends without commits and without a live `DISPUTED FINDINGS:` marker, and only a human keystroke at the gate can accept a dispute.
 - The Codex session id is recovered by matching the worktree path against rollout files under `~/.codex/sessions/`; the worktree path is unique per run, which is what makes this safe. Keep it that way.
 - The pipeline works on a detached worktree of the pushed PR head. Codex pushes during fix steps via `git push origin HEAD:refs/heads/<branch>` (the exact command is part of its standing rules because a bare `git push` fails on a detached HEAD); the pipeline re-pushes as a safety net and waits until GitHub reports the pushed sha as the PR head before reading checks. It must never touch the user's checkout.
+- Codex fix sessions run with `--dangerously-bypass-approvals-and-sandbox` by default (`--sandboxed` opts out): they push and watch CI unattended, which a sandboxed `codex exec` would silently skip. This applies only to the fix sessions; `pr-codex-review` manages its own read-only sandbox.
 - The fix-log comment after each review round is posted by the pipeline via `gh pr comment` from the `PR COMMENT:` section of the round's Codex message (fallback: the round's commit list). Codex itself must never create or edit PR comments, and no comment may mention AI or automation.
 
 ## Checks before committing
