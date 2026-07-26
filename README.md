@@ -109,7 +109,7 @@ Stream the full Codex and review output to the terminal
 instead of the quiet status line.
 
 --no-notify
-Disable macOS notifications (the terminal bell stays).
+Disable terminal notifications (the terminal bell stays).
 
 --no-direnv
 Skip direnv allow/exec.
