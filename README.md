@@ -1,5 +1,20 @@
 # babysit
 
+> [!IMPORTANT]
+> **Deprecated.** This tool is now part of
+> [quorum](https://github.com/yungweng/quorum), which merges
+> `pr-codex-review`, `babysit` and `prbot` into a single binary.
+>
+> ```bash
+> brew install yungweng/tap/quorum
+> ```
+>
+> `babysit 1811` becomes `quorum babysit 1811`.
+>
+> Behaviour is unchanged. What carried over and what deliberately did not is
+> recorded in [PARITY.md](https://github.com/yungweng/quorum/blob/main/PARITY.md).
+> This repository is archived and kept for reference.
+
 You implement, `babysit` iterates: review, fix, CI, repeat, until the PR is clean. Then you get a notification and do the manual test.
 
 `babysit` automates the loop after the first implementation of a PR exists. It runs [`pr-codex-review`](https://github.com/yungweng/pr-codex-review) and feeds the review findings into a resumable Codex session, which checks each finding (real issue or intended?), fixes the real ones, commits, and pushes. Watching CI is the pipeline's job, not Codex's, and the next review runs in the background while the pipeline waits for the checks. After each fix round the pipeline posts a comment to the PR logging what was fixed. The loop ends when a review reports zero Blockers and Critical findings and CI is green. Deliberately out of scope: picking issues, planning, and the first implementation. That part stays with you.
